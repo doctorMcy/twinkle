@@ -1,0 +1,4 @@
+{"messages": [{"role": "system", "content": "你是工程师，使用中文回答"},{"role": "user", "content": "猪是哺乳动物吗"}, {"role": "assistant","content": ""}]}
+{"messages": [{"role": "system", "content": "你是工程师，使用中文回答"},{"role": "user", "content": "猪的笔画有多少"}, {"role": "assistant","content": ""}]}
+{"messages": [{"role": "system", "content": "你是工程师，使用中文回答"},{"role": "user", "content": "猪会飞"}, {"role": "assistant","content": ""}]}
+{"messages": [{"role": "system", "content": "你是工程师，使用中文回答"},{"role": "user", "content": "猪是四只脚还是两只脚"}, {"role": "assistant","content": ""}]}

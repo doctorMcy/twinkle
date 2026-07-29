@@ -7,7 +7,7 @@ from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, SAPOLoss
 from .infonce import InfonceLoss
 from .mse import MSELoss
-from .ctkd import CTKDLoss
+from .cross_token import CrossTokenLoss
 
 torch_loss_mapping = {
     'mse': MSELoss,
@@ -29,5 +29,5 @@ torch_loss_mapping = {
     'orpo': ORPOLoss,
     # Embedding / contrastive losses
     'infonce': InfonceLoss,
-    'ctkd': CTKDLoss
+    'cross_token': CrossTokenLoss
 }
