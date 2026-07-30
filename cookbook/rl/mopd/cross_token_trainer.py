@@ -1,46 +1,55 @@
-"""Cross-Token Knowledge Distillation Training (On-Policy).
+"""Cross-Token Knowledge Distillation Training (Off-Policy).
 
-This script implements the X-Token training pipeline using CrossTokenLoss,
-which supports both P-KL and H-KL (with ULD) loss types for cross-tokenizer
-knowledge distillation.
+This script implements the NeMo-style X-Token training pipeline using
+CrossTokenLoss, supporting both P-KL and H-KL loss types for cross-tokenizer
+knowledge distillation. This is the twinkle equivalent of NeMo's
+``xtoken_off_policy_distillation.py``.
 
-Reference: https://arxiv.org/pdf/2605.21699
+Reference:
+    "X-Token: Projection-Guided Cross-Tokenizer Knowledge Distillation"
+    (https://arxiv.org/pdf/2605.21699)
 
-On-Policy Pipeline:
-    1. Sync student model weights to student vLLM sampler.
-    2. Student vLLM sampler generates completions on-the-fly.
-    3. Teacher vLLM sampler computes top-k prompt logprobs on student-generated sequences.
-    4. Student TransformersModel runs forward_backward() with CrossTokenLoss.
+Off-Policy Pipeline:
+    1. Dataloader provides pre-tokenized (prompt + response) batches using
+       the student tokenizer.
+    2. Each batch item is decoded to text and re-encoded with the teacher
+       tokenizer for cross-tokenizer teacher input.
+    3. Teacher TransformersModel computes full logits on teacher-tokenized
+       sequences.
+    4. Student TransformersModel runs forward_backward() with CrossTokenLoss
+       using teacher full logits.
 
 Architecture (Ray):
     +-----------------------------------------------------------------+
     | Driver (CPU)                                                    |
-    |  ckpt_manager.sync_weights() --> sync LoRA to student sampler  |
-    |  student_vllm.sample() --> on-policy completions            |
-    |  teacher_vllm.sample(prompt_logprobs=k) --> teacher lps        |
-    |  student_model.forward_backward(teacher_output=...) --> Loss   |
+    |  dataloader -> decode student tokens -> re-encode for teacher   |
+    |  teacher.forward_only(return_logits=True) -> teacher logits      |
+    |  student.forward_backward(**teacher_output) -> Loss             |
     +-----------------------------------------------------------------+
-         |               |                    |
-    DataLoader      vLLMSampler x2     TransformersModel
-                  student + teacher      (student)
+          |                    |                       |
+     DataLoader      TransformersModel         TransformersModel
+                     (teacher sampler group)   (student model group)
 
 Environment variables (all optional):
-    STUDENT_MODEL_ID  – (default: ms://Qwen/Qwen3-0.6B)
-    TEACHER_MODEL_ID  – (default: ms://Qwen/Qwen2.5-7B-Instruct)
-    DATASET_ID        – (default: ms://AI-ModelScope/shareAI-Llama3-DPO-zh-en-emoji)
-    MODEL_GPUS        – GPUs for student model               (default: 1)
-    SAMPLER_GPUS      – GPUs for each vLLM sampler           (default: 1)
-    BATCH_SIZE        – global batch size                    (default: 8)
-    MAX_STEPS         – total optimisation steps             (default: 4)
-    LR                – learning rate                        (default: 1e-5)
-    LOSS_TYPE         – loss type: 'pkl' or 'hkl'            (default: 'pkl')
-    TEMPERATURE       – distillation temperature             (default: 0.8)
-    MAX_LENGTH        – max span length for multi-token      (default: 4)
-    BETA              – base weight for projection           (default: 0.95)
-    GAMMA             – decay rate for multi-token weights   (default: 0.1)
-    GAMMA_KL          – weight for common-KL in H-KL         (default: 1.0)
-    GAMMA_ULD         – weight for ULD loss in H-KL         (default: 0.5)
-    TOPK              – top-k vocab for teacher logprobs     (default: 512)
+    STUDENT_MODEL_ID          – Student model path (default: /model/Qwen3-0.6B)
+    TEACHER_MODEL_ID          – Teacher model path (default: /nas/disk1/Qwen3-1.7B)
+    DATASET_ID                – Dataset path (JSONL file)
+    MODEL_GPUS                – GPUs for student model (default: 1)
+    SAMPLER_GPUS              – GPUs for teacher model / sampler (default: 1)
+    BATCH_SIZE                – Global batch size (default: 2)
+    MAX_STEPS                 – Total optimisation steps (default: 5)
+    LR                        – Learning rate (default: 1e-5)
+    GRADIENT_ACCUMULATION_STEPS – Gradient accumulation (default: 4)
+    LOSS_TYPE                 – 'pkl' or 'hkl' (default: 'pkl')
+    TEMPERATURE               – Distillation temperature (default: 0.8)
+    MAX_LENGTH                – Max span length for multi-token matching (default: 4)
+    BETA                      – Base weight for projection (default: 0.95)
+    GAMMA                     – Decay rate for multi-token weights (default: 0.1)
+    GAMMA_KL                  – Weight for common-KL in H-KL (default: 1.0)
+    GAMMA_ULD                 – Weight for ULD in H-KL (default: 0.5)
+    VOCAB_TOPK                – Top-k vocab for P-KL subset (default: 64)
+    UNCOMMON_TOPK             – Top-k for uncommon L1 in H-KL (default: 8192)
+    MAX_LENGTH_SEQ            – Max sequence length for dataset (default: 2048)
 """
 
 import os
@@ -52,7 +61,6 @@ from peft import LoraConfig
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
-from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
@@ -62,14 +70,16 @@ from twinkle.sampler import vLLMSampler
 
 logger = get_logger()
 
-# -- Configuration --
+# ── Configuration ─────────────────────────────────────────────────────────────
 STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', '/model/Qwen3-0.6B')
 TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', '/nas/disk1/Qwen3-1.7B')
-DATASET_ID = os.environ.get('DATASET_ID', '/root/twinkle/cookbook/rl/mopd/data.jsonl')
+DATASET_ID = os.environ.get(
+    'DATASET_ID', '/root/twinkle/cookbook/rl/mopd/data.jsonl'
+)
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 1))
-SAMPLER_GPUS = int(os.environ.get('SAMPLER_GPUS', 1))
-NUM_GPUS = MODEL_GPUS + 2 * SAMPLER_GPUS  # student_model + student_sampler + teacher_sampler
+TEACHER_GPUS = int(os.environ.get('TEACHER_GPUS', 1))
+NUM_GPUS = MODEL_GPUS + TEACHER_GPUS
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 5))
@@ -83,68 +93,24 @@ BETA = float(os.environ.get('BETA', 0.95))
 GAMMA = float(os.environ.get('GAMMA', 0.1))
 GAMMA_KL = float(os.environ.get('GAMMA_KL', 1.0))
 GAMMA_ULD = float(os.environ.get('GAMMA_ULD', 0.5))
-TOPK = int(os.environ.get('TOPK', 64))
+VOCAB_TOPK = int(os.environ.get('VOCAB_TOPK', 64))
+UNCOMMON_TOPK = int(os.environ.get('UNCOMMON_TOPK', 8192))
+MAX_LENGTH_SEQ = int(os.environ.get('MAX_LENGTH_SEQ', 2048))
+KL_LOSS_WEIGHT = float(os.environ.get('KL_LOSS_WEIGHT', 1.0))
+CE_LOSS_WEIGHT = float(os.environ.get('CE_LOSS_WEIGHT', 1.0))
+DYNAMIC_LOSS_SCALING = os.environ.get('DYNAMIC_LOSS_SCALING', 'false').lower() in ('true', '1', 'yes')
 
 ADAPTER_NAME = 'default'
-MAX_LENGTH_SEQ = int(os.environ.get('MAX_LENGTH_SEQ', 2048))
-MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 2048))
-N_SAMPLES = int(os.environ.get('N_SAMPLES', 1))
 
 
-# -- Utility functions --
-
-def convert_topk_prompt_logprobs(
-    topk_prompt_logprobs_batch: List[List[Optional[List[tuple]]]],
-    topk: int = 512,
-) -> dict:
-    """Convert vLLM topk_prompt_logprobs to CrossTokenLoss teacher_output format.
-
-    Args:
-        topk_prompt_logprobs_batch: List of per-input topk_prompt_logprobs.
-            Each is List[Optional[List[(token_id, logprob)]]] of shape [seq_len, topk].
-        topk: Number of top-k logits to extract.
-
-    Returns:
-        Dict with 'teacher_topk_logprobs' [batch, seq_len, topk] and
-        'teacher_topk_indices' [batch, seq_len, topk] tensors.
-    """
-    batch_logprobs = []
-    batch_indices = []
-    for seq_topk in topk_prompt_logprobs_batch:
-        seq_logprobs = []
-        seq_indices = []
-        print(f'seq_topk: {seq_topk},')
-        for pos_topk in seq_topk:
-            if pos_topk is None:
-                seq_logprobs.append([0.0] * topk)
-                seq_indices.append([0] * topk)
-            else:
-                seq_logprobs.append([lp for _, lp in pos_topk])
-                seq_indices.append([tid for tid, _ in pos_topk])
-        batch_logprobs.append(seq_logprobs)
-        batch_indices.append(seq_indices)
-
-    max_len = max(len(seq) for seq in batch_logprobs) if batch_logprobs else 1
-    for i in range(len(batch_logprobs)):
-        pad_len = max_len - len(batch_logprobs[i])
-        if pad_len > 0:
-            batch_logprobs[i].extend([[0.0] * topk] * pad_len)
-            batch_indices[i].extend([[0] * topk] * pad_len)
-
-    # Roll to align with labels (first position has no valid logprobs)
-    return {
-        'teacher_topk_logprobs': torch.roll(torch.tensor(batch_logprobs, dtype=torch.float32), shifts=-1, dims=1),
-        'teacher_topk_indices': torch.roll(torch.tensor(batch_indices, dtype=torch.long), shifts=-1, dims=1),
-    }
-
-
-# -- Dataset --
+# ── Dataset ───────────────────────────────────────────────────────────────────
 
 def create_dataset():
-    """Create a prompt-only dataset for on-policy distillation.
+    """Create a full-text (prompt + response) dataset for off-policy distillation.
 
-    The dataset only contains prompts; the student model generates completions
-    on-the-fly. The teacher model computes logprobs on student-generated sequences.
+    The dataset is encoded with the student tokenizer; teacher inputs are
+    produced by decoding to text and re-encoding with the teacher tokenizer
+    at each step.
     """
     dataset = Dataset(DatasetMeta(DATASET_ID, data_slice=range(10000)))
     dataset.set_template('Template', model_id=STUDENT_MODEL_ID, max_length=MAX_LENGTH_SEQ)
@@ -152,23 +118,62 @@ def create_dataset():
     return dataset
 
 
-# -- Training --
+# ── Utility ───────────────────────────────────────────────────────────────────
+
+def prepare_teacher_inputs(
+    batch: list,
+    student_tokenizer,
+    teacher_tokenizer,
+) -> list:
+    """Decode student tokens to text and re-encode with teacher tokenizer.
+
+    For off-policy distillation with different tokenizers, the teacher needs
+    its own tokenization of the same text content. We decode student input_ids
+    to raw text, then encode with the teacher tokenizer.
+
+    Args:
+        batch: List of dicts with 'input_ids' (list of token IDs).
+        student_tokenizer: Student model tokenizer (for decoding).
+        teacher_tokenizer: Teacher model tokenizer (for re-encoding).
+
+    Returns:
+        List of new_input_feature dicts with teacher-tokenized 'input_ids'.
+    """
+    teacher_inputs = []
+    for item in batch:
+        student_ids = item['input_ids']
+        text = student_tokenizer.decode(student_ids, skip_special_tokens=False)
+
+        # Re-encode with teacher tokenizer
+        teacher_ids = teacher_tokenizer.encode(text, add_special_tokens=True)
+        # Truncate to max sequence length
+        teacher_ids = teacher_ids[:MAX_LENGTH_SEQ]
+
+        teacher_inputs.append({
+            'input_ids': teacher_ids,
+            'labels': teacher_ids[:],  # Use same ids for CE masking
+        })
+    return teacher_inputs
+
+
+# ── Training ──────────────────────────────────────────────────────────────────
 
 def train():
-    """Main training loop for Cross-Token knowledge distillation."""
+    """Main training loop for off-policy cross-tokenizer distillation."""
     import time
     start_time = time.perf_counter()
     print('Recording start time')
 
-    # Initialize device groups for On-Policy mode
+    # ── Initialize device groups ──────────────────────────────────────────────
     device_groups = [
         DeviceGroup(name='student_model', ranks=MODEL_GPUS, device_type='npu'),
-        DeviceGroup(name='student_sampler', ranks=SAMPLER_GPUS, device_type='npu'),
-        DeviceGroup(name='teacher_sampler', ranks=SAMPLER_GPUS, device_type='npu'),
+        DeviceGroup(name='teacher', ranks=TEACHER_GPUS, device_type='npu'),
     ]
 
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
-    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
+    teacher_mesh = DeviceMesh.from_sizes(
+        world_size=TEACHER_GPUS, dp_size=TEACHER_GPUS
+    )
 
     twinkle.initialize(
         mode='ray',
@@ -179,7 +184,7 @@ def train():
     print(f"initialize elapsed: {elapsed:.6f}s")
     start_time = time.perf_counter()
 
-    # -- Student model (trainable) --
+    # ── Student model (trainable) ─────────────────────────────────────────────
     student_model = TransformersModel(
         model_id=STUDENT_MODEL_ID,
         device_mesh=model_mesh,
@@ -196,14 +201,23 @@ def train():
         lora_dropout=0.05,
         target_modules='all-linear',
     )
-    student_model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+    student_model.add_adapter_to_model(
+        ADAPTER_NAME, lora_config,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+    )
     student_model.set_optimizer('AdamW', lr=LEARNING_RATE, weight_decay=0.01)
-    student_model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=LEARNING_RATE * 0.1)
+    student_model.set_lr_scheduler(
+        'CosineAnnealingLR', T_max=MAX_STEPS, eta_min=LEARNING_RATE * 0.1,
+    )
 
-    # -- Configure CrossTokenLoss --
+    # ── Configure CrossTokenLoss ──────────────────────────────────────────────
     from transformers import AutoTokenizer
-    student_tokenizer = AutoTokenizer.from_pretrained(STUDENT_MODEL_ID, trust_remote_code=True)
-    teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL_ID, trust_remote_code=True)
+    student_tokenizer = AutoTokenizer.from_pretrained(
+        STUDENT_MODEL_ID, trust_remote_code=True
+    )
+    teacher_tokenizer = AutoTokenizer.from_pretrained(
+        TEACHER_MODEL_ID, trust_remote_code=True
+    )
     elapsed = time.perf_counter() - start_time
     print(f"tokenizer init: {elapsed:.6f}s")
     start_time = time.perf_counter()
@@ -218,18 +232,27 @@ def train():
         temperature=TEMPERATURE,
         gamma_kl=GAMMA_KL,
         gamma_uld=GAMMA_ULD,
-        vocab_topk=TOPK,
+        vocab_topk=VOCAB_TOPK,
+        uncommon_topk=UNCOMMON_TOPK,
+        kl_loss_weight=KL_LOSS_WEIGHT,
+        ce_loss_weight=CE_LOSS_WEIGHT,
+        dynamic_loss_scaling=DYNAMIC_LOSS_SCALING,
         device=torch.device('npu:0'),
     )
     student_model.set_loss(loss_fn, adapter_name=ADAPTER_NAME)
-    student_model.set_template('Template', model_id=STUDENT_MODEL_ID, adapter_name=ADAPTER_NAME)
+    student_model.set_template(
+        'Template', model_id=STUDENT_MODEL_ID, adapter_name=ADAPTER_NAME,
+    )
     elapsed = time.perf_counter() - start_time
     print(f"loss_fn init: {elapsed:.6f}s")
     start_time = time.perf_counter()
 
     # Log configuration
-    logger.info(f'GPU Configuration: MODEL_GPUS={MODEL_GPUS}, SAMPLER_GPUS={SAMPLER_GPUS}')
-    logger.info(f'Total GPUs required: {NUM_GPUS} (On-Policy: student_model + student_sampler + teacher_sampler)')
+    logger.info(
+        f'GPU Configuration: MODEL_GPUS={MODEL_GPUS}, '
+        f'TEACHER_GPUS={TEACHER_GPUS}'
+    )
+    logger.info(f'Total GPUs required: {NUM_GPUS} (student + teacher)')
 
     # Log projection matrix statistics
     stats = loss_fn.get_mapping_statistics()
@@ -238,40 +261,29 @@ def train():
     coverage_ratio = stats['exact_matched'] / stats['total_student_tokens']
     logger.info(f'Vocabulary coverage ratio: {coverage_ratio:.2%}')
     if coverage_ratio < 0.3:
-        logger.warning(f"Low vocabulary coverage ({coverage_ratio:.2%}), consider using models with similar tokenizers")
+        logger.warning(
+            f"Low vocabulary coverage ({coverage_ratio:.2%}), "
+            "consider using models with similar tokenizers"
+        )
 
     if LOSS_TYPE == 'hkl':
         logger.info(f'H-KL mode: gamma_kl={GAMMA_KL}, gamma_uld={GAMMA_ULD}')
-        logger.info(f'  Unmatched tokens (ULD): {stats["unmatched"]}/{stats["total_student_tokens"]}')
+        logger.info(
+            f'  Unmatched tokens (ULD): '
+            f'{stats["unmatched"]}/{stats["total_student_tokens"]}'
+        )
 
-    # -- Student vLLM sampler (for on-policy generation) --
-    student_sampler = vLLMSampler(
-        model_id=STUDENT_MODEL_ID,
-        engine_args={
-            'gpu_memory_utilization': 0.75,
-            'max_model_len': 4096,
-            'enable_lora': True,
-            'max_lora_rank': 8,
-        },
-        device_mesh=sampler_mesh,
-        remote_group='student_sampler',
-    )
-    student_sampler.set_template('Template', model_id=STUDENT_MODEL_ID)
-
-    # -- Teacher TransformersModel (for full logits computation) --
+    # ── Teacher TransformersModel ─────────────────────────────────────────────
+    # Use TransformersModel to get full-vocab logits from the teacher.
+    # vLLMSampler is limited to prompt_logprobs top-k (typically <= 64).
     teacher_model = TransformersModel(
         model_id=TEACHER_MODEL_ID,
-        device_mesh=sampler_mesh,
-        remote_group='teacher_sampler',
+        device_mesh=teacher_mesh,
+        remote_group='teacher',
     )
-
-    # 添加以下配置
     teacher_model.set_template('Template', model_id=TEACHER_MODEL_ID)
 
-    # -- Checkpoint manager for weight sync --
-    ckpt_manager = CheckpointEngineManager(model=student_model, sampler=student_sampler)
-
-    # -- DataLoader --
+    # ── DataLoader ────────────────────────────────────────────────────────────
     dataloader = DataLoader(
         dataset=create_dataset(),
         batch_size=BATCH_SIZE,
@@ -281,14 +293,29 @@ def train():
     )
 
     logger.info(get_device_placement())
-    logger.info(f'CrossToken Training | student={STUDENT_MODEL_ID}  teacher={TEACHER_MODEL_ID}')
-    logger.info(f'  loss_type={LOSS_TYPE}  T={TEMPERATURE}  topk={TOPK}')
-    logger.info(f'  beta={BETA}  gamma={GAMMA}  max_length={MAX_LENGTH}')
+    logger.info(
+        f'CrossToken Off-Policy Training | '
+        f'student={STUDENT_MODEL_ID}  teacher={TEACHER_MODEL_ID}'
+    )
+    logger.info(
+        f'  loss_type={LOSS_TYPE}  T={TEMPERATURE}  vocab_topk={VOCAB_TOPK}'
+    )
+    logger.info(
+        f'  beta={BETA}  gamma={GAMMA}  max_length={MAX_LENGTH}'
+    )
     if LOSS_TYPE == 'hkl':
-        logger.info(f'  gamma_kl={GAMMA_KL}  gamma_uld={GAMMA_ULD}')
-    logger.info(f'  batch_size={BATCH_SIZE}  lr={LEARNING_RATE}  max_steps={MAX_STEPS}')
+        logger.info(
+            f'  gamma_kl={GAMMA_KL}  gamma_uld={GAMMA_ULD}  '
+            f'uncommon_topk={UNCOMMON_TOPK}'
+        )
+    logger.info(
+        f'  batch_size={BATCH_SIZE}  lr={LEARNING_RATE}  '
+        f'max_steps={MAX_STEPS}  kl_w={KL_LOSS_WEIGHT}  ce_w={CE_LOSS_WEIGHT}'
+    )
+    if DYNAMIC_LOSS_SCALING:
+        logger.info('  dynamic_loss_scaling=enabled')
 
-    # -- Training Loop (On-Policy) --
+    # ── Training Loop (Off-Policy) ────────────────────────────────────────────
     optim_step = 0
     for batch in dataloader:
         if optim_step >= MAX_STEPS:
@@ -296,107 +323,63 @@ def train():
         if callable(batch):
             batch = batch()
 
-        # Step 1: Sync student model weights to student sampler
-        ckpt_manager.sync_weights(merge_and_sync=False)
-        student_sampler.reset_prefix_cache()
-        student_sampler.reset_encoder_cache()
-
-        # Step 2: Student vLLM generates completions
-        sample_response = student_sampler.sample(
-            batch,
-            SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=1.0, num_samples=N_SAMPLES),
+        # ── Step 1: Prepare teacher inputs via decode-re-encode ───────────────
+        teacher_inputs = prepare_teacher_inputs(
+            batch, student_tokenizer, teacher_tokenizer
         )
 
-        # --- Print student responses as text ---
-        print("\n" + "=" * 80)
-        print(f"[Step {optim_step}] STUDENT GENERATED RESPONSES:")
-        print("=" * 80)
-        for i, resp in enumerate(sample_response):
-            for j, seq in enumerate(resp.sequences):
-                # seq.tokens 只包含新生成的 token（不含 prompt）
-                gen_text = student_tokenizer.decode(seq.tokens, skip_special_tokens=False)
-                # new_input_feature 中的 input_ids 包含 prompt + 新生成 token
-                full_text = student_tokenizer.decode(seq.new_input_feature['input_ids'], skip_special_tokens=False)
-                print(f"\n--- Student sample[{i}].sequence[{j}] ---")
-                # print(f"  FULL TEXT (prompt + generation): {full_text}")
-                # print(f"  GENERATED ONLY (from seq.tokens): {gen_text}")
-                # if seq.decoded is not None:
-                #     print(f"  seq.decoded: {seq.decoded}")
-                # print(f"  stop_reason: {seq.stop_reason}")
-                # 打印生成 token 的概率序列（每个 token 位置的 top-k logprobs）
-                if seq.logprobs is not None:
-                    print(f"  GENERATED LOGPROBS (per token position, top-5 shown):")
-                    for pos, pos_logprobs in enumerate(seq.logprobs):
-                        top5 = sorted(pos_logprobs, key=lambda x: x[1], reverse=True)[:5]
-                        tokens_str = ", ".join([f"(id={tid}, logprob={lp:.4f})" for tid, lp in top5])
-                        print(f"    pos[{pos}]: {tokens_str}")
-                else:
-                    print(f"  GENERATED LOGPROBS: None")
-
-        # Extract the generated sequences (prompt + student-generated response)
-        input_data = [seq.new_input_feature for response in sample_response for seq in response.sequences]
-
-        # Re-encode student-generated text with teacher tokenizer.
-        # For same-tokenizer-family scenarios, decode-encode is a lossy round-trip
-        # that can produce token sequences of different lengths, causing the loss
-        # to compare misaligned positions (inflated KL). Instead, reuse the
-        # student token ids directly when the tokenizers share a common vocab.
-        # The CrossTokenLoss projection matrix handles the cross-tokenizer mapping.
-        teacher_input_data = []
-        for feat in input_data:
-            student_ids = feat['input_ids']
-            if isinstance(student_ids, (list, tuple)):
-                student_ids = torch.tensor(student_ids, dtype=torch.long)
-            teacher_input_data.append({
-                'input_ids': student_ids,
-                'labels': student_ids.clone().detach() if hasattr(student_ids, 'clone') else student_ids,
-            })
-
-        # Step 3: Teacher computes full logits on student-generated sequences
-        # Use TransformersModel to get full logits (no vLLM 64 limit)
-        # Note: forward_only is a remote_function, need to call it to get the actual result
-
-        # 添加详细的输入数据调试信息
-        print(f'\n{"="*80}')
-        print(f'[Step {optim_step}] TEACHER INPUT DATA DEBUG:')
-        print(f'{"="*80}')
-        print(f'teacher_input_data length: {len(teacher_input_data)}')
-        for i, feat in enumerate(teacher_input_data[:2]):  # 只打印前两个样本的详细信息
-            print(f'  Sample {i}:')
-            print(f'    input_ids shape: {feat["input_ids"].shape if isinstance(feat["input_ids"], torch.Tensor) else len(feat["input_ids"])}')
-            print(f'    labels shape: {feat["labels"].shape if isinstance(feat["labels"], torch.Tensor) else len(feat["labels"])}')
-            print(f'    input_ids[:10]: {feat["input_ids"][:10] if hasattr(feat["input_ids"], "__getitem__") else "N/A"}')
-            print(f'    labels[:10]: {feat["labels"][:10] if hasattr(feat["labels"], "__getitem__") else "N/A"}')
-
-        # 确保启用 return_logits=True 以获取 logits
+        # ── Step 2: Teacher forward → full logits ────────────────────────────
         teacher_outputs = teacher_model.forward_only(
-            inputs=teacher_input_data,
-            return_logits=True,  # 必须启用 return_logits
+            inputs=teacher_inputs,
+            return_logits=True,
             temperature=1.0,
             disable_lora=True,
-            adapter_name=''
+            adapter_name='',
         )
-        teacher_outputs = teacher_outputs()  # 调用函数获取实际结果
+        teacher_outputs = teacher_outputs()  # remote_function → actual result
 
-        # Step 4: Prepare teacher output with full logits
-        # Use input_ids from teacher_input_data (actual tokens used by TransformersModel).
-        teacher_prompt_ids = [torch.tensor(feat['input_ids'], dtype=torch.long)
-                              for feat in teacher_input_data]
-        teacher_padded = rnn_utils.pad_sequence(
-            teacher_prompt_ids,
-            batch_first=True,
-            padding_value=0,
+        # ── Step 3: Package teacher output ────────────────────────────────────
+        teacher_logits = teacher_outputs['logits']
+
+        # Build teacher input_ids tensor (padded) for optional alignment
+        teacher_prompt_ids = [
+            torch.tensor(feat['input_ids'], dtype=torch.long)
+            for feat in teacher_inputs
+        ]
+        teacher_input_ids = rnn_utils.pad_sequence(
+            teacher_prompt_ids, batch_first=True, padding_value=0,
         )
-        # Use raw logits instead of log probabilities for NeMo-style P-KL
-        teacher_logits = teacher_outputs['logits']  # Get raw logits from teacher model
+
+        # For cross-tokenizer training, use student input_ids as labels
+        # so that all positions participate in distillation (not just response).
+        # The -100 mask from standard supervised training masks prompt positions
+        # but for KD we want all positions.
+        student_labels_list = []
+        for item in batch:
+            labels = torch.tensor(item['input_ids'], dtype=torch.long)
+            student_labels_list.append(labels)
+        student_labels = rnn_utils.pad_sequence(
+            student_labels_list, batch_first=True, padding_value=-100,
+        )
+
         teacher_output = {
-            'teacher_logits_group': [teacher_logits],  # Use raw logits for P-KL
-            'teacher_input_ids_group': [teacher_padded],
+            'teacher_logits_group': [teacher_logits],
+            'teacher_input_ids_group': [teacher_input_ids],
+            'teacher_labels': [student_labels],
         }
 
-        # Step 5: Student forward + CrossToken backward
+        # DEBUG: Log shapes
+        print(f"\n[Step {optim_step}] Data shapes:")
+        print(f"  teacher_logits: {teacher_logits.shape}")
+        print(f"  student_labels: {student_labels.shape}")
+        print(
+            f"  student_labels non-(-100): "
+            f"{(student_labels != -100).sum().item()}"
+        )
+
+        # ── Step 4: Student forward + CrossToken backward ────────────────────
         student_model.forward_backward(
-            inputs=input_data,
+            inputs=batch,
             adapter_name=ADAPTER_NAME,
             return_logits=True,
             **teacher_output,
@@ -404,20 +387,26 @@ def train():
 
         student_model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
 
-        # Logging
+        # ── Logging ───────────────────────────────────────────────────────────
         if optim_step > 0 and optim_step % 2 == 0:
-            metric = student_model.calculate_metric(is_training=True, adapter_name=ADAPTER_NAME)
+            metric = student_model.calculate_metric(
+                is_training=True, adapter_name=ADAPTER_NAME,
+            )
             logger.info(f'[Step {optim_step}/{MAX_STEPS}] {metric}')
 
-        # Checkpoint
+        # ── Checkpoint ────────────────────────────────────────────────────────
         if optim_step > 0 and optim_step % 100 == 0:
-            student_model.save(f'cross-token-ckpt-{optim_step}', adapter_name=ADAPTER_NAME)
+            student_model.save(
+                f'cross-token-ckpt-{optim_step}', adapter_name=ADAPTER_NAME,
+            )
 
         optim_step += 1
 
-    # Save final checkpoint
+    # ── Save final checkpoint ─────────────────────────────────────────────────
     student_model.save('cross-token-final', adapter_name=ADAPTER_NAME)
-    logger.info('CrossToken training completed.')
+    logger.info(
+        f'CrossToken off-policy training completed after {optim_step} steps.'
+    )
 
 
 if __name__ == '__main__':
