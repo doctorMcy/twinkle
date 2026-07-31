@@ -37,6 +37,42 @@ import torch.nn.functional as F
 from twinkle.data_format import LossOutput
 from twinkle.loss.base import Loss
 
+
+# ------------------------------------------------------------------
+# Module-level helpers (replicating NeMo's chunk/log-prob utilities)
+# ------------------------------------------------------------------
+
+def _chunk_average_log_probs(
+    log_probs: torch.Tensor,
+    chunk_id: torch.Tensor,
+    max_chunks: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Average ``log_probs`` over chunks defined by ``chunk_id``.
+
+    Builds a one-hot chunk mask from ``chunk_id`` (``-1`` = no chunk), then
+    ``bmm``-aggregates and divides by chunk sizes.  Mirrors NeMo's
+    ``chunk_average_log_probs`` (without CP all-reduce, since twinkle runs
+    single-rank loss).
+
+    Args:
+        log_probs: ``[B, T, V]`` log-probabilities.
+        chunk_id: ``[B, T]`` long tensor, values in ``[-1, max_chunks)``.
+        max_chunks: number of chunk buckets.
+
+    Returns:
+        chunk_log_probs: ``[B, max_chunks, V]`` averaged log-probs.
+        chunk_sizes: ``[B, max_chunks]`` float tensor of bucket sizes.
+    """
+    device = log_probs.device
+    chunk_arange = torch.arange(max_chunks, device=device).view(1, 1, -1)
+    chunk_mask = chunk_id.unsqueeze(-1) == chunk_arange  # [B, T, C]
+    chunk_mask_f = chunk_mask.transpose(1, 2).to(log_probs.dtype)  # [B, C, T]
+    chunk_sums = torch.bmm(chunk_mask_f, log_probs)  # [B, C, V]
+    chunk_sizes = chunk_mask.sum(dim=1).float()  # [B, C]
+    eps = 1e-10
+    chunk_log_probs = chunk_sums / (chunk_sizes.unsqueeze(-1) + eps)
+    return chunk_log_probs, chunk_sizes
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
@@ -402,6 +438,11 @@ class CrossTokenLoss(Loss):
         if student_logits is None:
             raise ValueError("logits not found in outputs")
 
+        # ── Chunk-alignment input_ids (optional) ───────────────────────
+        # Per-teacher input_ids for character-span chunk alignment.
+        teacher_input_ids_group = kwargs.get('teacher_input_ids_group')
+        student_ids_for_align = inputs.get('input_ids')  # list or tensor
+
         # Compute loss per teacher
         total_kd = torch.tensor(0.0, device=student_logits.device)
         ce_loss = self._compute_ce(student_logits, labels)
@@ -412,8 +453,19 @@ class CrossTokenLoss(Loss):
             weight = self.teacher_weights[i]
 
             if self.loss_type == 'pkl':
+                # Resolve per-teacher chunk-alignment input_ids.
+                s_ids = self._resolve_alignment_ids(
+                    student_ids_for_align, 'student'
+                )
+                t_ids = self._resolve_alignment_ids(
+                    teacher_input_ids_group, i
+                    if teacher_input_ids_group is not None
+                    else None,
+                )
                 kd, metrics = self._compute_pkl(
-                    student_logits, t_logits, labels, i
+                    student_logits, t_logits, labels, i,
+                    student_input_ids=s_ids,
+                    teacher_input_ids=t_ids,
                 )
             elif self.loss_type == 'hkl':
                 kd, metrics = self._compute_hkl(
@@ -450,6 +502,13 @@ class CrossTokenLoss(Loss):
             print(f"  Teacher {idx} (w={m['weight']:.3f}): kd={m['kd_loss']:.6f}")
             if 'proj_accuracy' in m:
                 print(f"    proj_acc={m['proj_accuracy']:.4f}")
+            if 'proj_mass_min' in m:
+                print(
+                    f"    proj_mass: min={m['proj_mass_min']:.4f}  "
+                    f"mean={m['proj_mass_mean']:.4f}"
+                )
+            if 'teacher_topk_cov' in m:
+                print(f"    teacher_topk_cov={m['teacher_topk_cov']:.4f}")
             if 'kl_common' in m:
                 print(f"    kl_common={m['kl_common']:.6f}  "
                       f"l1_uncommon={m.get('l1_uncommon', 0):.6f}  "
@@ -499,88 +558,152 @@ class CrossTokenLoss(Loss):
         teacher_probs: torch.Tensor,
         labels: torch.Tensor,
         teacher_index: int,
+        *,
+        student_input_ids: Optional[torch.Tensor] = None,
+        teacher_input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict]:
-        """NeMo-style projection-KL loss.
+        """NeMo-style projection-KL loss with chunk alignment.
 
-        Steps:
-        1. Shift logits for next-token prediction.
-        2. Compute student probs with temperature, project to teacher vocab.
-        3. Select microbatch-global top-k from teacher.
-        4. Slice both sides to top-k and renormalize.
-        5. Compute per-position KL, mask, and mean.
-        6. Scale by T^2.
+        When both ``student_input_ids`` and ``teacher_input_ids`` are provided,
+        character-span alignment is used to assign each teacher token to the
+        best-matching student position (chunk), then teacher log-probs are
+        chunk-averaged before KL computation — matching NeMo's
+        ``_compute_p_kl`` behaviour.  Otherwise falls back to per-position KL
+        with simple ``min(seq_len)`` truncation.
+
+        Diagnostics printed per step:
+          - ``proj_mass_min/mean`` — projected probability mass per position
+            (catches projection coverage gaps)
+          - ``teacher_topk_cov`` — fraction of teacher probability mass
+            captured by the top-k vocab subset
         """
         T = self.temperature
         eps = 1e-10
 
-        # Shift for next-token prediction
+        # ── Next-token shift ─────────────────────────────────────────────
         shift_student_logits = student_logits[..., :-1, :].contiguous()
-        shift_teacher = teacher_probs[..., :-1, :].contiguous().to(student_logits.device)
+        shift_teacher = teacher_probs[..., :-1, :].contiguous().to(
+            shift_student_logits.device
+        )
+        shift_labels = labels[..., 1:].contiguous().to(shift_student_logits.device)
 
-        # Align sequence lengths
-        stu_seq_len = shift_student_logits.shape[1]
-        tea_seq_len = shift_teacher.shape[1]
-        min_seq_len = min(stu_seq_len, tea_seq_len)
-        shift_student_logits = shift_student_logits[:, :min_seq_len, :]
-        shift_teacher = shift_teacher[:, :min_seq_len, :]
-
-        shift_labels = labels[..., 1:].contiguous().to(student_logits.device)
-        shift_labels = shift_labels[:, :min_seq_len]
-        loss_mask = (shift_labels != -100).float()
-
-        batch_size, seq_len, _ = shift_student_logits.shape
-        # Tokenizer vocab size (used to size the projection matrix).
-        # The model's lm_head may have a larger out_features (HF padding).
+        # ── Tokenizer-level vocab sizing (HF lm_head may be wider) ───────
         tkr_vocab_size = self.teacher_vocab_sizes[teacher_index]
         model_vocab_size = shift_teacher.shape[-1]
-
-        # Student log-probs with temperature
-        student_log_probs = F.log_softmax(shift_student_logits / T, dim=-1)
-        student_probs = student_log_probs.exp()
-
-        # Project student probs to teacher vocab via sparse W
-        projected = self._project_student_probs(
-            student_probs, teacher_index, tkr_vocab_size
-        )
-
-        # Slice teacher tensor to the tokenizer vocab width — the projection
-        # matrix is sized to len(tokenizer), while the model may pad
-        # lm_head.out_features beyond that (e.g. Qwen3: tokenizer 151669,
-        # lm_head 151936). The padded columns are not real tokens and have
-        # no projection entries, so they are discarded.
         if model_vocab_size > tkr_vocab_size:
             shift_teacher = shift_teacher[..., :tkr_vocab_size]
 
-        # Microbatch-global top-k from teacher logits
-        # If teacher_probs are actually probabilities (not logits), convert back
+        # ── Chunk alignment (character-span based) ───────────────────────
+        use_chunk_alignment = (
+            student_input_ids is not None
+            and teacher_input_ids is not None
+            and self.num_teachers == 1  # multi-teacher alignment is complex
+        )
+        if use_chunk_alignment:
+            (
+                student_chunk_id,   # [B, Ts-1]  values in [-1, max_chunks)
+                teacher_chunk_id,   # [B, Tt-1]  values in [-1, max_chunks)
+                max_chunks,
+            ) = self._build_chunk_ids(
+                student_input_ids, teacher_input_ids, teacher_index,
+            )
+            # Trim seq dims to match the shifted logits
+            s_clen = shift_student_logits.shape[1]
+            t_clen = shift_teacher.shape[1]
+            student_chunk_id = student_chunk_id[:, :s_clen]
+            teacher_chunk_id = teacher_chunk_id[:, :t_clen]
+            shift_labels = shift_labels[:, :s_clen]
+        else:
+            # Fallback: simple min(seq_len) truncation (original behaviour)
+            s_clen = shift_student_logits.shape[1]
+            t_clen = shift_teacher.shape[1]
+            min_len = min(s_clen, t_clen)
+            shift_student_logits = shift_student_logits[:, :min_len, :]
+            shift_teacher = shift_teacher[:, :min_len, :]
+            shift_labels = shift_labels[:, :min_len]
+            s_clen = min_len
+            t_clen = min_len
+
+        # ── Build loss mask ──────────────────────────────────────────────
+        loss_mask = (shift_labels != -100).float()  # [B, min_len]
+
+        # ── Student log-probs + projection ───────────────────────────────
+        student_log_probs = F.log_softmax(shift_student_logits / T, dim=-1)
+        student_probs = student_log_probs.exp()
+
+        projected = self._project_student_probs(
+            student_probs, teacher_index, tkr_vocab_size
+        )  # [B, S_s, V_t]
+
+        # ── Diagnose projection coverage ─────────────────────────────────
+        with torch.no_grad():
+            proj_mass = projected.sum(dim=-1)  # [B, S]
+            _masked_mass = proj_mass * loss_mask
+            proj_mass_mean = (
+                _masked_mass.sum() / loss_mask.sum().clamp(min=1.0)
+            ).item()
+            proj_mass_min = proj_mass[loss_mask.bool()].min().item() if loss_mask.sum() > 0 else 1.0
+
+        # ── Teacher logits → log-probs ───────────────────────────────────
         if shift_teacher.max() <= 1.0 and shift_teacher.sum(dim=-1).min() > 0.5:
             teacher_logits_approx = torch.log(shift_teacher.clamp(min=eps))
         else:
             teacher_logits_approx = shift_teacher
 
+        tkr_teacher_log_probs = torch.log_softmax(
+            teacher_logits_approx / T, dim=-1
+        )  # [B, T_t, V_t]
+
+        # ── Microbatch-global top-k ──────────────────────────────────────
         k = min(self.vocab_topk, tkr_vocab_size, projected.shape[-1])
         teacher_flat = teacher_logits_approx.reshape(-1, tkr_vocab_size)
-        importance = teacher_flat.max(dim=0).values  # [V_t]
+        importance = teacher_flat.max(dim=0).values
         _, topk_idx = torch.topk(importance, k=k)
         topk_idx = topk_idx.sort().values  # [k]
 
-        # Slice to top-k subset.
-        # projected_k comes from projected student probs (non-negative).
-        projected_k = projected[..., topk_idx]  # [B, S, k]
-        # teacher_logits_approx contains raw logits; use log_softmax to get
-        # proper log-probs, exactly as NeMo does in _compute_p_kl.
-        teacher_log_probs_k = torch.log_softmax(
-            teacher_logits_approx[..., topk_idx] / T, dim=-1
-        )  # [B, S, k]
+        # ── Chunk-average (if alignment available) ───────────────────────
+        if use_chunk_alignment:
+            # Student side: chunk-average the projected probs
+            projected_chunks, _ = _chunk_average_log_probs(
+                projected, student_chunk_id, max_chunks
+            )  # [B, C, V_t]
+            # Teacher side: chunk-average the teacher log-probs
+            teacher_chunks, _ = _chunk_average_log_probs(
+                tkr_teacher_log_probs, teacher_chunk_id, max_chunks
+            )  # [B, C, V_t]
+            # Valid chunk mask: chunks that have both student and teacher
+            # contributions (nonzero student chunk size + nonzero teacher).
+            s_sizes = (student_chunk_id.unsqueeze(-1)
+                       == torch.arange(max_chunks, device=student_chunk_id.device).view(1, 1, -1)).sum(dim=1).float()
+            t_sizes = (teacher_chunk_id.unsqueeze(-1)
+                       == torch.arange(max_chunks, device=teacher_chunk_id.device).view(1, 1, -1)).sum(dim=1).float()
+            chunk_valid = (s_sizes > 0) & (t_sizes > 0)  # [B, C]
+            # Use student chunk as the KL axis
+            proj_C = projected_chunks
+            tgt_C = teacher_chunks
+            valid_mask = chunk_valid  # [B, C]
+        else:
+            # Per-position (no chunk averaging)
+            proj_C = projected
+            tgt_C = tkr_teacher_log_probs
+            valid_mask = loss_mask > 0  # [B, S]
 
-        # Renormalize projected student probs within the top-k subset.
+        # ── Slice to top-k ───────────────────────────────────────────────
+        projected_k = proj_C[..., topk_idx]  # [B, C|S, k]
+        teacher_log_probs_k = tgt_C[..., topk_idx]  # [B, C|S, k]
+
+        # Renormalize projected student within top-k
         projected_k = projected_k / (projected_k.sum(dim=-1, keepdim=True) + eps)
         log_projected_k = (projected_k + eps).log()
 
-        # Teacher is already log-probs from log_softmax.
+        # Teacher within top-k: already subset of log_softmax; renormalize
+        # to ensure the K-subset sums to 1 under exp.
+        teacher_log_probs_k = teacher_log_probs_k - torch.logsumexp(
+            teacher_log_probs_k, dim=-1, keepdim=True
+        )
         log_teacher_k = teacher_log_probs_k
-        teacher_k = log_teacher_k.exp()  # for accuracy computation below
 
+        # ── KL divergence ────────────────────────────────────────────────
         if self.reverse_kl:
             per_pos_kl = F.kl_div(
                 log_teacher_k, log_projected_k,
@@ -592,21 +715,155 @@ class CrossTokenLoss(Loss):
                 reduction='none', log_target=True,
             ).sum(dim=-1)
 
-        masked_kl = (per_pos_kl * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+        valid_f = valid_mask.float()
+        masked_kl = (per_pos_kl * valid_f).sum() / valid_f.sum().clamp(min=1.0)
         kd_loss = masked_kl * T * T
 
-        # Projection accuracy: argmax match on top-k subset
+        # ── Diagnostic: teacher top-k coverage ───────────────────────────
         with torch.no_grad():
-            proj_top1 = projected_k.argmax(dim=-1)  # [B, S]
-            teach_top1 = teacher_k.argmax(dim=-1)  # [B, S]
-            matches = (proj_top1 == teach_top1) & loss_mask.bool()
-            proj_acc = matches.sum().float() / loss_mask.sum().clamp(min=1.0)
+            teacher_all_probs = torch.softmax(teacher_logits_approx / T, dim=-1)
+            teacher_topk_cov = teacher_all_probs[..., topk_idx].sum(dim=-1).mean().item()
+
+        # ── Accuracy ─────────────────────────────────────────────────────
+        with torch.no_grad():
+            teacher_k = torch.softmax(teacher_logits_approx[..., topk_idx] / T, dim=-1)
+            if use_chunk_alignment:
+                teacher_k, _ = _chunk_average_log_probs(
+                    teacher_k.log(), teacher_chunk_id, max_chunks
+                )
+                teacher_k = teacher_k.exp()
+            proj_top1 = projected_k.argmax(dim=-1)
+            teach_top1 = teacher_k.argmax(dim=-1)
+            matches = (proj_top1 == teach_top1) & valid_mask
+            proj_acc = matches.sum().float() / valid_f.sum().clamp(min=1.0)
 
         metrics = {
             'kd_loss': kd_loss.item(),
             'proj_accuracy': proj_acc.item(),
+            'proj_mass_min': proj_mass_min,
+            'proj_mass_mean': proj_mass_mean,
+            'teacher_topk_cov': teacher_topk_cov,
         }
         return kd_loss, metrics
+
+    # ------------------------------------------------------------------
+    # Chunk alignment helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_alignment_ids(
+        ids_source, index_or_name
+    ) -> Optional[torch.Tensor]:
+        """Resolve input_ids from various sources to a [B, S] tensor.
+
+        ``ids_source`` may be:
+        - ``None`` → return ``None`` (no alignment)
+        - ``list`` of ``[B, S]`` tensors per teacher → index by ``index_or_name``
+        - ``torch.Tensor`` [B, S] (e.g. student input_ids from inputs dict)
+        """
+        if ids_source is None:
+            return None
+        if isinstance(ids_source, list):
+            if isinstance(index_or_name, int) and 0 <= index_or_name < len(ids_source):
+                t = ids_source[index_or_name]
+                return t if isinstance(t, torch.Tensor) else torch.tensor(t)
+            return None
+        if isinstance(ids_source, torch.Tensor):
+            return ids_source
+        return None
+
+    @staticmethod
+    def _character_spans(
+        token_ids: torch.Tensor,
+        tokenizer: "PreTrainedTokenizer",
+    ) -> list:
+        """Build ``(start_char, end_char)`` spans for each position.
+
+        Returns a list of ``(start, end)`` tuples per batch item,
+        each inner list has length ``seq_len``.
+        """
+        spans_batch: list = []
+        for b in range(token_ids.shape[0]):
+            ids = token_ids[b].tolist()
+            spans: list = []
+            for pos in range(len(ids)):
+                prefix = tokenizer.decode(
+                    ids[: pos + 1], skip_special_tokens=False
+                )
+                if pos == 0:
+                    prev_len = 0
+                else:
+                    prev = tokenizer.decode(
+                        ids[:pos], skip_special_tokens=False
+                    )
+                    prev_len = len(prev)
+                end = len(prefix)
+                spans.append((prev_len, end))
+            spans_batch.append(spans)
+        return spans_batch
+
+    def _build_chunk_ids(
+        self,
+        student_input_ids: torch.Tensor,
+        teacher_input_ids: torch.Tensor,
+        teacher_index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Build chunk-id tensors via character-span overlap.
+
+        Each student position is its own chunk (``max_chunks = seq_len_s - 1``
+        after shift).  Each teacher position is assigned to the student chunk
+        with which it shares the greatest character overlap.
+
+        Returns:
+            ``(student_chunk_id, teacher_chunk_id, max_chunks)``.
+            Both tensors have shape ``[B, seq_len - 1]`` (next-token shifted)
+            with values in ``[-1, max_chunks)``; ``-1`` = unassigned.
+        """
+        device = student_input_ids.device
+        batch_size = student_input_ids.shape[0]
+        # Use shifted lengths (position i predicts token i+1)
+        s_len = student_input_ids.shape[1] - 1
+        t_len = teacher_input_ids.shape[1] - 1
+        max_chunks = s_len  # one chunk per student token position
+
+        teacher_tok = self.teacher_tokenizer_group[teacher_index]
+
+        # Build character spans for original (unshifted) sequences, then drop
+        # the first position to align with next-token shift.
+        s_spans_full = self._character_spans(student_input_ids, self.student_tokenizer)
+        t_spans_full = self._character_spans(teacher_input_ids, teacher_tok)
+
+        s_chunk_id = torch.full(
+            (batch_size, s_len), -1, dtype=torch.long, device=device
+        )
+        t_chunk_id = torch.full(
+            (batch_size, t_len), -1, dtype=torch.long, device=device
+        )
+
+        for b in range(batch_size):
+            # Shift: position i in chunk_id corresponds to predicting token i+1
+            # The span for prediction at position i is the span of token i.
+            s_spans = s_spans_full[b][:s_len]  # drop last, keep first s_len
+            t_spans = t_spans_full[b][:t_len]
+
+            # Each student chunk = its own index
+            for s_pos in range(s_len):
+                s_chunk_id[b, s_pos] = s_pos
+
+            # Assign each teacher position to best-overlap student chunk
+            for t_pos in range(t_len):
+                t_start, t_end = t_spans[t_pos]
+                best_s = -1
+                best_overlap = 0
+                for s_pos in range(s_len):
+                    s_start, s_end = s_spans[s_pos]
+                    overlap = max(0, min(s_end, t_end) - max(s_start, t_start))
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_s = s_pos
+                t_chunk_id[b, t_pos] = best_s
+
+        return s_chunk_id, t_chunk_id, max_chunks
 
     def _project_student_probs(
         self,
