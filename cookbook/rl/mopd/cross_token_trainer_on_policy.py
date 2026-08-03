@@ -128,6 +128,7 @@ def create_dataset():
     dataset = Dataset(DatasetMeta(DATASET_ID, data_slice=range(10000)))
     dataset.set_template(
         'Template', model_id=STUDENT_MODEL_ID, max_length=MAX_LENGTH_SEQ,
+        enable_thinking=False,
     )
     dataset.encode(load_from_cache_file=True)
     return dataset
@@ -257,6 +258,7 @@ def train():
     student_model.set_loss(loss_fn, adapter_name=ADAPTER_NAME)
     student_model.set_template(
         'Template', model_id=STUDENT_MODEL_ID, adapter_name=ADAPTER_NAME,
+        enable_thinking=False,
     )
     elapsed = time.perf_counter() - start_time
     print(f"loss_fn init: {elapsed:.6f}s")
@@ -293,7 +295,9 @@ def train():
         device_mesh=sampler_mesh,
         remote_group='student_sampler',
     )
-    student_sampler.set_template('Template', model_id=STUDENT_MODEL_ID)
+    student_sampler.set_template(
+        'Template', model_id=STUDENT_MODEL_ID, enable_thinking=False,
+    )
 
     # ── Teacher TransformersModel (for full logits) ───────────────────────────
     teacher_model = TransformersModel(
@@ -301,7 +305,9 @@ def train():
         device_mesh=teacher_mesh,
         remote_group='teacher',
     )
-    teacher_model.set_template('Template', model_id=TEACHER_MODEL_ID)
+    teacher_model.set_template(
+        'Template', model_id=TEACHER_MODEL_ID, enable_thinking=False,
+    )
 
     # ── Checkpoint manager for weight sync ────────────────────────────────────
     ckpt_manager = CheckpointEngineManager(
