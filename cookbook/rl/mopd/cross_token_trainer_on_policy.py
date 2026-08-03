@@ -167,6 +167,192 @@ def prepare_teacher_inputs_from_student_gen(
     return teacher_inputs
 
 
+def _as_list(ids):
+    """Convert token ids (tensor / list / array) to a plain Python list."""
+    if isinstance(ids, torch.Tensor):
+        return ids.tolist()
+    return list(ids)
+
+
+def print_full_outputs(
+    optim_step: int,
+    sample_response: list,
+    teacher_inputs: list,
+    student_tokenizer,
+    teacher_tokenizer,
+) -> None:
+    """Print complete student/teacher outputs (source text + token ids).
+
+    Args:
+        optim_step: Current optimisation step (for the log header).
+        sample_response: vLLM responses from student_sampler.sample().
+        teacher_inputs: Teacher-tokenized inputs from
+            prepare_teacher_inputs_from_student_gen() (flat over samples).
+        student_tokenizer: Student tokenizer (for decoding).
+        teacher_tokenizer: Teacher tokenizer (for decoding).
+    """
+    print(f"\n{'='*80}")
+    print(f"[Step {optim_step}] FULL OUTPUTS (STUDENT → TEACHER):")
+    print(f"{'='*80}")
+    t_idx = 0
+    for i, resp in enumerate(sample_response):
+        for j, seq in enumerate(resp.sequences):
+            s_ids = seq.new_input_feature['input_ids']
+            s_text = student_tokenizer.decode(s_ids, skip_special_tokens=False)
+            t_ids = teacher_inputs[t_idx]['input_ids']
+            t_text = teacher_tokenizer.decode(t_ids, skip_special_tokens=False)
+            t_idx += 1
+            print(f"\n  Sample[{i}].Seq[{j}] STUDENT:")
+            print(f"    源文本: {s_text}")
+            print(f"    tokenid: {_as_list(s_ids)}")
+            print(f"  Sample[{i}].Seq[{j}] TEACHER:")
+            print(f"    源文本: {t_text}")
+            print(f"    tokenid: {_as_list(t_ids)}")
+
+
+def print_cross_token_mapping(
+    optim_step: int,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    student_ids: torch.Tensor,
+    teacher_ids: torch.Tensor,
+    labels: torch.Tensor,
+    loss_fn,
+) -> None:
+    """Print per-token student↔teacher token-id mapping with probabilities.
+
+    The probability columns replicate ``CrossTokenLoss._compute_pkl`` exactly
+    (same temperature-scaled softmax, same probs/logits heuristic, same
+    character-span chunk alignment), so the printed values match the loss
+    internals.
+
+    Row format:
+        学生投影前 → 学生投影后 → 教师概率 → 教师对学生tokenid的概率
+        | 学生tokenId(学生文本) → 教师tokenId(教师文本) [匹配关系]
+
+    Column semantics:
+      - 学生投影前: student prob of its own generated token (softmax / T)
+      - 学生投影后: projected student prob (on teacher vocab) at the teacher
+        token the student token maps to; '-' when unmapped
+      - 教师概率: teacher prob of its own token at the aligned teacher position
+      - 教师对学生tokenid的概率: teacher prob at the aligned position of the raw
+        student token id used directly as a teacher-vocab index; '-' when the
+        id is out of the teacher vocab range
+      - 匹配关系: 精确 (weight 1.0) / 多token (β·γ^i) / 未匹配
+    """
+    T = loss_fn.temperature
+    eps = 1e-10
+    teacher_index = 0
+    tkr_vocab_size = loss_fn.teacher_vocab_sizes[teacher_index]
+    student_tok = loss_fn.student_tokenizer
+    teacher_tok = loss_fn.teacher_tokenizer_group[teacher_index]
+
+    # Projection matrix → {student token id: [(teacher id, weight), ...]}
+    s_idx = loss_fn.projection_student_indices_list[teacher_index].cpu()
+    t_idx = loss_fn.projection_teacher_indices_list[teacher_index].cpu()
+    values = loss_fn.projection_values_list[teacher_index].cpu().float()
+    proj_map = {}
+    for s, t, v in zip(s_idx.tolist(), t_idx.tolist(), values.tolist()):
+        proj_map.setdefault(s, []).append((t, v))
+
+    # ── Shift / vocab trim / chunk alignment (same as _compute_pkl) ─────
+    shift_labels = labels[..., 1:]
+    s_clen = min(shift_labels.shape[1], student_logits.shape[1] - 1)
+    shift_labels = shift_labels[:, :s_clen]
+
+    shift_teacher = teacher_logits[..., :-1, :].float().cpu()
+    if shift_teacher.shape[-1] > tkr_vocab_size:
+        shift_teacher = shift_teacher[..., :tkr_vocab_size]
+    t_clen = shift_teacher.shape[1]
+
+    _, teacher_chunk_id, _ = loss_fn._build_chunk_ids(
+        student_ids, teacher_ids, teacher_index,
+    )
+    teacher_chunk_id = teacher_chunk_id[:, :t_clen]
+
+    # Teacher probs (same probs/logits heuristic as the loss)
+    if shift_teacher.max() <= 1.0 and shift_teacher.sum(dim=-1).min() > 0.5:
+        teacher_logits_approx = torch.log(shift_teacher.clamp(min=eps))
+    else:
+        teacher_logits_approx = shift_teacher
+
+    batch_size = shift_labels.shape[0]
+    for b in range(batch_size):
+        # Student probs + projection (per-sample to bound peak memory)
+        shift_student = student_logits[b:b + 1, :-1, :].float().cpu()
+        student_probs = torch.softmax(shift_student / T, dim=-1)
+        projected = loss_fn._project_student_probs(
+            student_probs, teacher_index, tkr_vocab_size,
+        )
+        teacher_probs = torch.softmax(
+            teacher_logits_approx[b:b + 1] / T, dim=-1,
+        )
+
+        print(f"\n[Step {optim_step}] CROSS-TOKEN TOKEN MAPPING (sample {b}):")
+        print(
+            '  学生投影前 → 学生投影后 → 教师概率 → 教师对学生tokenid的概率'
+            ' | 学生tokenId(学生文本) → 教师tokenId(教师文本) [匹配关系]'
+        )
+        for i in range(s_clen):
+            s_token = int(shift_labels[b, i])
+            if s_token == -100:
+                continue
+
+            s_text = student_tok.decode([s_token], skip_special_tokens=False)
+            p_before = float(student_probs[0, i, s_token].item())
+
+            # Projection match type: 精确 / 多token / 未匹配
+            entries = proj_map.get(s_token, [])
+            exact = [e for e in entries if e[1] == 1.0]
+            multi = [e for e in entries if 0.0 < e[1] < 1.0]
+            if exact:
+                t_star, _ = exact[0]
+                match_type = '精确'
+                p_after = float(projected[0, i, t_star].item())
+            elif multi:
+                t_star, _ = multi[0]  # first mapping = highest weight (β)
+                match_type = '多token'
+                p_after = float(projected[0, i, t_star].item())
+            else:
+                t_star = None
+                match_type = '未匹配'
+                p_after = None
+
+            # Aligned teacher position: first teacher position of chunk i
+            t_positions = (teacher_chunk_id[b] == i).nonzero(as_tuple=True)[0]
+            if t_positions.numel() > 0:
+                t_pos = int(t_positions[0].item())
+                t_own = int(teacher_ids[b, t_pos + 1])
+                p_teacher_own = float(teacher_probs[0, t_pos, t_own].item())
+                if s_token < tkr_vocab_size:
+                    p_teacher_student = float(
+                        teacher_probs[0, t_pos, s_token].item()
+                    )
+                else:
+                    p_teacher_student = None
+            else:
+                p_teacher_own = None
+                p_teacher_student = None
+
+            p_after_s = f'{p_after:.4f}' if p_after is not None else '-'
+            p_own_s = f'{p_teacher_own:.4f}' if p_teacher_own is not None else '-'
+            p_stu_s = (
+                f'{p_teacher_student:.4f}'
+                if p_teacher_student is not None else '-'
+            )
+            if t_star is not None:
+                t_star_text = teacher_tok.decode(
+                    [t_star], skip_special_tokens=False
+                )
+                t_pair = f'{t_star}({t_star_text})'
+            else:
+                t_pair = '-'
+            print(
+                f'  {p_before:.4f} → {p_after_s} → {p_own_s} → {p_stu_s}'
+                f' | {s_token}({s_text}) → {t_pair} [{match_type}]'
+            )
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train():
@@ -377,22 +563,15 @@ def train():
             for seq in resp.sequences
         ]
 
-        # Print generated responses (first sample only for brevity)
-        print(f"\n{'='*80}")
-        print(f"[Step {optim_step}] STUDENT GENERATED RESPONSES:")
-        print(f"{'='*80}")
-        for i, resp in enumerate(sample_response[:1]):
-            for j, seq in enumerate(resp.sequences[:1]):
-                full_text = student_tokenizer.decode(
-                    seq.new_input_feature['input_ids'], skip_special_tokens=False,
-                )
-                print(f"\n  Sample[{i}].Seq[{j}]:")
-                print(f"  {full_text[:500]}..." if len(full_text) > 500
-                      else f"  {full_text}")
-
         # ── Step 3: Prepare teacher inputs (decode + re-encode) ──────────────
         teacher_inputs = prepare_teacher_inputs_from_student_gen(
             sample_response, student_tokenizer, teacher_tokenizer,
+        )
+
+        # DEBUG: 完整输出(源文本 + tokenid)
+        print_full_outputs(
+            optim_step, sample_response, teacher_inputs,
+            student_tokenizer, teacher_tokenizer,
         )
 
         # ── Step 4: Teacher forward → full logits ────────────────────────────
@@ -425,6 +604,9 @@ def train():
         student_labels = rnn_utils.pad_sequence(
             student_labels_list, batch_first=True, padding_value=-100,
         )
+        student_ids = rnn_utils.pad_sequence(
+            student_labels_list, batch_first=True, padding_value=0,
+        )
 
         teacher_output = {
             'teacher_logits_group': [teacher_logits],
@@ -443,11 +625,23 @@ def train():
         )
 
         # ── Step 6: Student forward + CrossToken backward ────────────────────
-        student_model.forward_backward(
+        student_outputs = student_model.forward_backward(
             inputs=input_data,
             adapter_name=ADAPTER_NAME,
             return_logits=True,
             **teacher_output,
+        )
+        student_outputs = student_outputs()  # remote_function → actual result
+
+        # DEBUG: 逐 token 映射关系(学生/教师 tokenid + 概率)
+        print_cross_token_mapping(
+            optim_step,
+            student_outputs['logits'],
+            teacher_logits,
+            student_ids,
+            teacher_input_ids,
+            student_labels,
+            loss_fn,
         )
 
         student_model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
