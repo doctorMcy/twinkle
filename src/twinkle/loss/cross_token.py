@@ -345,13 +345,16 @@ class CrossTokenLoss(Loss):
     def _build_projection_matrix_for_teacher(self, teacher_tokenizer, teacher_index):
         """Build sparse projection matrix W in COO format.
 
-        Token matching is exact-text first (raw decoded token text), falling
-        back to stripped-text matching.  Stripped matching collapses
+        Token matching priority: same-id first, then exact-text (raw decoded
+        token text), then stripped-text fallback.  Stripped matching collapses
         whitespace/space-prefixed variants (e.g. '的' vs ' 的') into a single
         target, so the projected student mass lands on a token the teacher
         gives ~0 probability — inflating the KL even for identical
         student/teacher models.  Exact-first keeps such variants distinct
-        when both exist in the teacher vocabulary.
+        when both exist in the teacher vocabulary.  Same-id-first additionally
+        fixes "same-text-multi-id" collapse (byte-fallback tokens: many ids
+        decode to U+FFFD), where two models agreeing on token X would
+        otherwise be compared against a different id with the same text.
         """
         student_indices = []
         teacher_indices = []
@@ -372,7 +375,16 @@ class CrossTokenLoss(Loss):
             student_token_text = self.student_tokenizer.decode(
                 [student_id], skip_special_tokens=False
             )
-            teacher_id = teacher_exact_text_to_id.get(student_token_text)
+            # 同 id 优先:学生 id 在教师词表内且解码文本相同 → 恒等映射
+            # (修复同文本多 id 坍缩,如字节回退 token 多个 id 均解码为 U+FFFD)
+            teacher_id = None
+            if student_id < len(teacher_tokenizer):
+                if teacher_tokenizer.decode(
+                    [student_id], skip_special_tokens=False
+                ) == student_token_text:
+                    teacher_id = student_id
+            if teacher_id is None:
+                teacher_id = teacher_exact_text_to_id.get(student_token_text)
             if teacher_id is None:
                 teacher_id = teacher_stripped_text_to_id.get(
                     student_token_text.strip()

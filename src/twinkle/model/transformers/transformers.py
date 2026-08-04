@@ -635,6 +635,18 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         outputs = self.forward(inputs=inputs, **kwargs)
+        # Debug: Print generated text from model outputs
+        if outputs.get('logits') is not None and self._default_tokenizer is not None:
+            logits = outputs['logits']
+            if isinstance(logits, torch.Tensor) and logits.dim() == 3:
+                # Get predicted token ids (argmax of logits)
+                predicted_ids = torch.argmax(logits, dim=-1)
+                # Only decode first sample for debugging
+                first_sample_ids = predicted_ids[0].tolist()
+                # Filter out padding tokens if needed
+                filtered_ids = [tid for tid in first_sample_ids if tid != self._default_tokenizer.pad_token_id]
+                generated_text = self._default_tokenizer.decode(filtered_ids, skip_special_tokens=True)
+                logger.info(f"[DEBUG] Generated text (first sample): {generated_text[:500]}...")
         loss = self.calculate_loss(**kwargs)
         outputs['loss'] = loss
         self.backward(**kwargs)
