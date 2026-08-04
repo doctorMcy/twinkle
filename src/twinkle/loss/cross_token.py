@@ -28,6 +28,7 @@ Key differences from CTKDLoss:
 """
 from typing import TYPE_CHECKING, Dict, Optional, Tuple
 import hashlib
+import os
 import pickle
 import threading
 
@@ -248,7 +249,8 @@ class CrossTokenLoss(Loss):
     def _build_exact_token_maps(self):
         """Build common/uncommon token partitions for H-KL mode.
 
-        Common: tokens with exact text match between student and teacher.
+        Common: tokens with a text match between student and teacher, matched
+        exact-text first (raw decoded token text) with stripped-text fallback.
         Uncommon: all other tokens.
         """
         self._common_student_indices_list = []
@@ -256,13 +258,13 @@ class CrossTokenLoss(Loss):
         self._uncommon_student_indices_list = []
         self._uncommon_teacher_indices_list = []
 
-        # Build student text -> id mapping
+        # Build student text -> id mapping (raw text, no strip)
         student_vocab = self.student_tokenizer.get_vocab()
         student_id_to_text = {}
         for token_str, token_id in student_vocab.items():
             student_id_to_text[token_id] = self.student_tokenizer.decode(
                 [token_id], skip_special_tokens=False
-            ).strip()
+            )
 
         for i, teacher_tok in enumerate(self.teacher_tokenizer_group):
             teacher_vocab = teacher_tok.get_vocab()
@@ -270,13 +272,21 @@ class CrossTokenLoss(Loss):
             for token_str, token_id in teacher_vocab.items():
                 teacher_id_to_text[token_id] = teacher_tok.decode(
                     [token_id], skip_special_tokens=False
-                ).strip()
+                )
 
-            # Build text -> teacher_id mapping
-            teacher_text_to_id = {}
+            # Build text -> teacher_id mappings: exact (raw) text first,
+            # stripped text as fallback.  Stripped matching collapses
+            # whitespace/space-prefixed variants (e.g. '的' vs ' 的') into one
+            # entry, which inflates the KL even for identical models; exact
+            # matching keeps such variants distinct when both exist.
+            teacher_exact_text_to_id = {}
+            teacher_stripped_text_to_id = {}
             for token_id in range(len(teacher_tok)):
-                token_text = teacher_tok.decode([token_id], skip_special_tokens=False).strip()
-                teacher_text_to_id[token_text] = token_id
+                token_text = teacher_tok.decode(
+                    [token_id], skip_special_tokens=False
+                )
+                teacher_exact_text_to_id[token_text] = token_id
+                teacher_stripped_text_to_id[token_text.strip()] = token_id
 
             # Find common tokens
             common_s = []
@@ -285,9 +295,14 @@ class CrossTokenLoss(Loss):
             for s_id in range(self.student_vocab_size):
                 if s_id in student_id_to_text:
                     s_text = student_id_to_text[s_id]
-                    if s_text in teacher_text_to_id:
+                    teacher_id = teacher_exact_text_to_id.get(s_text)
+                    if teacher_id is None:
+                        teacher_id = teacher_stripped_text_to_id.get(
+                            s_text.strip()
+                        )
+                    if teacher_id is not None:
                         common_s.append(s_id)
-                        common_t.append(teacher_text_to_id[s_text])
+                        common_t.append(teacher_id)
                     else:
                         uncommon_s.append(s_id)
 
@@ -328,23 +343,41 @@ class CrossTokenLoss(Loss):
         return hashlib.md5(config_bytes).hexdigest()
 
     def _build_projection_matrix_for_teacher(self, teacher_tokenizer, teacher_index):
-        """Build sparse projection matrix W in COO format."""
+        """Build sparse projection matrix W in COO format.
+
+        Token matching is exact-text first (raw decoded token text), falling
+        back to stripped-text matching.  Stripped matching collapses
+        whitespace/space-prefixed variants (e.g. '的' vs ' 的') into a single
+        target, so the projected student mass lands on a token the teacher
+        gives ~0 probability — inflating the KL even for identical
+        student/teacher models.  Exact-first keeps such variants distinct
+        when both exist in the teacher vocabulary.
+        """
         student_indices = []
         teacher_indices = []
         values = []
         matched_student_ids = set()
 
-        teacher_token_text_to_id = {}
+        # Exact (raw) text first, stripped text as fallback
+        teacher_exact_text_to_id = {}
+        teacher_stripped_text_to_id = {}
         for token_id in range(len(teacher_tokenizer)):
-            token_text = teacher_tokenizer.decode([token_id], skip_special_tokens=False).strip()
-            teacher_token_text_to_id[token_text] = token_id
+            token_text = teacher_tokenizer.decode(
+                [token_id], skip_special_tokens=False
+            )
+            teacher_exact_text_to_id[token_text] = token_id
+            teacher_stripped_text_to_id[token_text.strip()] = token_id
 
         for student_id in range(self.student_vocab_size):
             student_token_text = self.student_tokenizer.decode(
                 [student_id], skip_special_tokens=False
-            ).strip()
-            if student_token_text in teacher_token_text_to_id:
-                teacher_id = teacher_token_text_to_id[student_token_text]
+            )
+            teacher_id = teacher_exact_text_to_id.get(student_token_text)
+            if teacher_id is None:
+                teacher_id = teacher_stripped_text_to_id.get(
+                    student_token_text.strip()
+                )
+            if teacher_id is not None:
                 student_indices.append(student_id)
                 teacher_indices.append(teacher_id)
                 values.append(1.0)
@@ -576,6 +609,13 @@ class CrossTokenLoss(Loss):
             (catches projection coverage gaps)
           - ``teacher_topk_cov`` — fraction of teacher probability mass
             captured by the top-k vocab subset
+          - ``KL ANOMALIES`` — top-N positions with the largest per-position
+            KL (env ``XTOKEN_DEBUG_KL_TOPN``, default 20) plus a count of
+            positions exceeding ``XTOKEN_DEBUG_KL_THRESHOLD`` (default 10.0),
+            each row carrying the student/teacher token mapping info and the
+            top-k renormalized student/teacher probabilities of the projection
+            target (``p_k``/``q_k``) plus the teacher-position count of the
+            chunk (``t_n``) for verification
         """
         T = self.temperature
         eps = 1e-10
@@ -677,7 +717,11 @@ class CrossTokenLoss(Loss):
                        == torch.arange(max_chunks, device=student_chunk_id.device).view(1, 1, -1)).sum(dim=1).float()
             t_sizes = (teacher_chunk_id.unsqueeze(-1)
                        == torch.arange(max_chunks, device=teacher_chunk_id.device).view(1, 1, -1)).sum(dim=1).float()
-            chunk_valid = (s_sizes > 0) & (t_sizes > 0)  # [B, C]
+            # 有效 chunk 还需学生标签有效:教师侧 padding token(id 0)的字符
+            # 跨度会与学生的 padding chunk 重叠,把填充位置计入 KD 均值,
+            # 抬高 masked_kl(现象:valid 数 > 非 -100 标签数)
+            chunk_valid = ((s_sizes > 0) & (t_sizes > 0)
+                           & (shift_labels != -100))  # [B, C]
             # Use student chunk as the KL axis
             proj_C = projected_chunks
             tgt_C = teacher_chunks
@@ -718,6 +762,182 @@ class CrossTokenLoss(Loss):
         valid_f = valid_mask.float()
         masked_kl = (per_pos_kl * valid_f).sum() / valid_f.sum().clamp(min=1.0)
         kd_loss = masked_kl * T * T
+
+        # ── DEBUG: KL 异常位置(散度值最大的 top-N + 阈值统计) ────────────
+        # 打印逐位置 KL 最大的 top-N 位置及阈值统计,每行附带与 trainer
+        # 映射表一致的模型输出信息(位置、学生/教师 tokenId+文本、匹配关系、
+        # 四列概率)。配置:XTOKEN_DEBUG_KL_TOPN(默认 20)、
+        # XTOKEN_DEBUG_KL_THRESHOLD(默认 10.0)。
+        with torch.no_grad():
+            valid_kl = per_pos_kl * valid_f  # [B, C|S],无效位置为 0
+            num_valid = int(valid_f.sum().item())
+            if num_valid > 0:
+                top_n = max(
+                    1, int(os.environ.get('XTOKEN_DEBUG_KL_TOPN', '20'))
+                )
+                thresh = float(
+                    os.environ.get('XTOKEN_DEBUG_KL_THRESHOLD', '10.0')
+                )
+
+                max_kl = valid_kl.max().item()
+                n_over = int((valid_kl > thresh).sum().item())
+
+                # top-N 位置索引 (b, c)
+                flat = valid_kl.flatten()
+                top_kl, top_flat_idx = flat.topk(min(top_n, num_valid))
+                b_ids = (top_flat_idx // valid_kl.shape[1]).tolist()
+                c_ids = (top_flat_idx % valid_kl.shape[1]).tolist()
+
+                # 投影矩阵 → {学生 tokenid: [(教师 tokenid, weight), ...]}
+                # (懒缓存,避免每步重建)
+                if not hasattr(self, '_debug_proj_maps'):
+                    self._debug_proj_maps = [None] * self.num_teachers
+                if self._debug_proj_maps[teacher_index] is None:
+                    s_p = self.projection_student_indices_list[
+                        teacher_index].cpu()
+                    t_p = self.projection_teacher_indices_list[
+                        teacher_index].cpu()
+                    v_p = self.projection_values_list[
+                        teacher_index].cpu().float()
+                    proj_map = {}
+                    for s_, t_, v_ in zip(
+                        s_p.tolist(), t_p.tolist(), v_p.tolist()
+                    ):
+                        proj_map.setdefault(s_, []).append((t_, v_))
+                    self._debug_proj_maps[teacher_index] = proj_map
+                proj_map = self._debug_proj_maps[teacher_index]
+
+                stu_tok = self.student_tokenizer
+                tea_tok = self.teacher_tokenizer_group[teacher_index]
+
+                print(f"\n=== KL ANOMALIES (teacher={teacher_index}, "
+                      f"valid={num_valid}, mean={masked_kl.item():.4f}, "
+                      f"max={max_kl:.4f}, >{thresh:.1f}: {n_over}, "
+                      f"T={T:.2f}, kd={kd_loss.item():.4f}) ===")
+                print('  KL | 位置 | 学生投影前 → 学生投影后 → 教师概率 → '
+                      '教师对学生tokenid的概率 | 学生tokenId(学生文本) → '
+                      '教师tokenId(教师文本) [匹配关系]'
+                      ' | p_k(投影目标) q_k(投影目标) t_n(教师位置数)')
+                def _fmt_prob(v):
+                    """Format a probability; use scientific notation below 1e-4."""
+                    if v is None:
+                        return '-'
+                    if v >= 1e-4:
+                        return f'{v:.4f}'
+                    return f'{v:.2e}'
+                for kl_val, b_i, c_i in zip(top_kl.tolist(), b_ids, c_ids):
+                    s_token = int(shift_labels[b_i, c_i])
+                    if s_token == -100:
+                        continue
+                    s_text = stu_tok.decode(
+                        [s_token], skip_special_tokens=False
+                    )
+                    p_before = float(
+                        student_probs[b_i, c_i, s_token].item()
+                    )
+
+                    # 投影映射:精确 / 多token / 未匹配
+                    entries = proj_map.get(s_token, [])
+                    exact = [e for e in entries if e[1] == 1.0]
+                    multi = [e for e in entries if 0.0 < e[1] < 1.0]
+                    if exact:
+                        t_star, _ = exact[0]
+                        match_type = '精确'
+                        p_after = float(projected[b_i, c_i, t_star].item())
+                    elif multi:
+                        t_star, _ = multi[0]  # 首个映射 = 权重最大(β)
+                        match_type = '多token'
+                        p_after = float(projected[b_i, c_i, t_star].item())
+                    else:
+                        t_star = None
+                        match_type = '未匹配'
+                        p_after = None
+
+                    # top-k 重归一化空间中投影目标 token 的学生质量 p_k 与
+                    # 教师概率 q_k(验证 KL 触底机制:学生质量点对教师 q≈0);
+                    # 目标不在教师 top-k 子集内时按 0 计
+                    if t_star is not None:
+                        in_k = (topk_idx == t_star).nonzero()
+                        if in_k.numel() > 0:
+                            pos_k = int(in_k.flatten()[0])
+                            p_k = float(
+                                log_projected_k[b_i, c_i, pos_k].exp().item()
+                            )
+                            q_k = float(
+                                teacher_log_probs_k[
+                                    b_i, c_i, pos_k].exp().item()
+                            )
+                        else:
+                            p_k = 0.0
+                            q_k = 0.0
+                    else:
+                        p_k = None
+                        q_k = None
+                    # 该 chunk 内教师位置数(chunk 平均的样本量)
+                    t_n = (
+                        int(t_sizes[b_i, c_i].item())
+                        if use_chunk_alignment else None
+                    )
+
+                    # 教师对齐位置(chunk 模式:该 chunk 的首个教师位置)
+                    if use_chunk_alignment:
+                        t_positions = (
+                            teacher_chunk_id[b_i] == c_i
+                        ).nonzero(as_tuple=True)[0]
+                        t_pos = (
+                            int(t_positions[0].item())
+                            if t_positions.numel() > 0 else None
+                        )
+                    else:
+                        t_pos = c_i
+
+                    if t_pos is not None:
+                        if use_chunk_alignment:
+                            t_own = int(teacher_input_ids[b_i, t_pos + 1])
+                            p_teacher_own = float(
+                                tkr_teacher_log_probs[
+                                    b_i, t_pos, t_own].exp().item()
+                            )
+                        else:
+                            # fallback 模式无教师 ids,无法取教师自身 token
+                            p_teacher_own = None
+                        if s_token < tkr_vocab_size:
+                            p_teacher_student = float(
+                                tkr_teacher_log_probs[
+                                    b_i, t_pos, s_token].exp().item()
+                            )
+                        else:
+                            p_teacher_student = None
+                    else:
+                        p_teacher_own = None
+                        p_teacher_student = None
+
+                    p_after_s = (
+                        f'{p_after:.4f}' if p_after is not None else '-'
+                    )
+                    p_own_s = (
+                        f'{p_teacher_own:.4f}'
+                        if p_teacher_own is not None else '-'
+                    )
+                    p_stu_s = (
+                        f'{p_teacher_student:.4f}'
+                        if p_teacher_student is not None else '-'
+                    )
+                    if t_star is not None:
+                        t_star_text = tea_tok.decode(
+                            [t_star], skip_special_tokens=False
+                        )
+                        t_pair = f'{t_star}({t_star_text})'
+                    else:
+                        t_pair = '-'
+                    print(
+                        f'  {kl_val:.4f} | b={b_i},pos={c_i} | '
+                        f'{p_before:.4f} → {p_after_s} → {p_own_s} → '
+                        f'{p_stu_s} | {s_token}({s_text}) → '
+                        f'{t_pair} [{match_type}]'
+                        f' | p_k={_fmt_prob(p_k)} q_k={_fmt_prob(q_k)} '
+                        f't_n={t_n if t_n is not None else "-"}'
+                    )
 
         # ── Diagnostic: teacher top-k coverage ───────────────────────────
         with torch.no_grad():
