@@ -214,8 +214,16 @@ class CrossTokenLoss(Loss):
             import time
             start_time = time.perf_counter()
 
+            print('[CrossToken] Generating projection cache key ...', flush=True)
+            cache_start = time.perf_counter()
             cache_key = self._generate_cache_key()
+            print(
+                f'[CrossToken] Cache key generated in '
+                f'{time.perf_counter() - cache_start:.2f}s',
+                flush=True,
+            )
             if cache_key in _PROJECTION_MATRIX_CACHE:
+                print('[CrossToken] Using cached projection matrices', flush=True)
                 cached = _PROJECTION_MATRIX_CACHE[cache_key]
                 self.projection_student_indices_list = [
                     t.to(self.device) if self.device is not None else t.clone()
@@ -231,7 +239,13 @@ class CrossTokenLoss(Loss):
                 ]
             else:
                 for i, teacher_tok in enumerate(self.teacher_tokenizer_group):
+                    teacher_start = time.perf_counter()
                     self._build_projection_matrix_for_teacher(teacher_tok, i)
+                    print(
+                        f'[CrossToken] Teacher {i} projection built in '
+                        f'{time.perf_counter() - teacher_start:.2f}s',
+                        flush=True,
+                    )
                 _PROJECTION_MATRIX_CACHE[cache_key] = {
                     'student_indices': self.projection_student_indices_list,
                     'teacher_indices': self.projection_teacher_indices_list,
@@ -243,7 +257,7 @@ class CrossTokenLoss(Loss):
                 self._build_exact_token_maps()
 
             elapsed = time.perf_counter() - start_time
-            print(f"[CrossToken] Projection matrices built in {elapsed:.2f}s")
+            print(f"[CrossToken] Projection matrices built in {elapsed:.2f}s", flush=True)
             self._projection_matrices_built = True
 
     def _build_exact_token_maps(self):
@@ -258,13 +272,25 @@ class CrossTokenLoss(Loss):
         self._uncommon_student_indices_list = []
         self._uncommon_teacher_indices_list = []
 
+        import time
+        _maps_start = time.perf_counter()
+
+        def _progress(i: int, total: int, phase: str) -> None:
+            if i % 20000 == 0 or i == total:
+                print(
+                    f"[CrossToken]  [exact maps] {phase} {i}/{total} "
+                    f"({time.perf_counter() - _maps_start:.1f}s)",
+                    flush=True,
+                )
+
         # Build student text -> id mapping (raw text, no strip)
         student_vocab = self.student_tokenizer.get_vocab()
         student_id_to_text = {}
-        for token_str, token_id in student_vocab.items():
+        for idx, (token_str, token_id) in enumerate(student_vocab.items()):
             student_id_to_text[token_id] = self.student_tokenizer.decode(
                 [token_id], skip_special_tokens=False
             )
+            _progress(idx + 1, len(student_vocab), 'student decode')
 
         for i, teacher_tok in enumerate(self.teacher_tokenizer_group):
             teacher_vocab = teacher_tok.get_vocab()
@@ -287,12 +313,16 @@ class CrossTokenLoss(Loss):
                 )
                 teacher_exact_text_to_id[token_text] = token_id
                 teacher_stripped_text_to_id[token_text.strip()] = token_id
+                _progress(token_id + 1, len(teacher_tok),
+                          f'teacher {i} decode')
 
             # Find common tokens
             common_s = []
             common_t = []
             uncommon_s = []
             for s_id in range(self.student_vocab_size):
+                _progress(s_id + 1, self.student_vocab_size,
+                          f'teacher {i} common scan')
                 if s_id in student_id_to_text:
                     s_text = student_id_to_text[s_id]
                     teacher_id = teacher_exact_text_to_id.get(s_text)
@@ -361,15 +391,34 @@ class CrossTokenLoss(Loss):
         values = []
         matched_student_ids = set()
 
+        import time
+        _build_start = time.perf_counter()
+        teacher_vocab_size = len(teacher_tokenizer)
+        print(
+            f"[CrossToken]  [teacher {teacher_index}] building projection "
+            f"matrix (student vocab {self.student_vocab_size}, teacher vocab "
+            f"{teacher_vocab_size})",
+            flush=True,
+        )
+
+        def _progress(phase: str, i: int, total: int) -> None:
+            if i % 20000 == 0 or i == total:
+                print(
+                    f"[CrossToken]  [teacher {teacher_index}] {phase} "
+                    f"{i}/{total} ({time.perf_counter() - _build_start:.1f}s)",
+                    flush=True,
+                )
+
         # Exact (raw) text first, stripped text as fallback
         teacher_exact_text_to_id = {}
         teacher_stripped_text_to_id = {}
-        for token_id in range(len(teacher_tokenizer)):
+        for token_id in range(teacher_vocab_size):
             token_text = teacher_tokenizer.decode(
                 [token_id], skip_special_tokens=False
             )
             teacher_exact_text_to_id[token_text] = token_id
             teacher_stripped_text_to_id[token_text.strip()] = token_id
+            _progress('phase1: teacher decode', token_id + 1, teacher_vocab_size)
 
         for student_id in range(self.student_vocab_size):
             student_token_text = self.student_tokenizer.decode(
@@ -378,7 +427,7 @@ class CrossTokenLoss(Loss):
             # 同 id 优先:学生 id 在教师词表内且解码文本相同 → 恒等映射
             # (修复同文本多 id 坍缩,如字节回退 token 多个 id 均解码为 U+FFFD)
             teacher_id = None
-            if student_id < len(teacher_tokenizer):
+            if student_id < teacher_vocab_size:
                 if teacher_tokenizer.decode(
                     [student_id], skip_special_tokens=False
                 ) == student_token_text:
@@ -394,12 +443,24 @@ class CrossTokenLoss(Loss):
                 teacher_indices.append(teacher_id)
                 values.append(1.0)
                 matched_student_ids.add(student_id)
+            _progress(
+                'phase2: student exact match',
+                student_id + 1, self.student_vocab_size,
+            )
 
         for student_id in range(self.student_vocab_size):
             if student_id in matched_student_ids:
+                _progress(
+                    'phase3: multi-token match',
+                    student_id + 1, self.student_vocab_size,
+                )
                 continue
             text = self.student_tokenizer.decode([student_id], skip_special_tokens=False)
             if not text or not text.strip():
+                _progress(
+                    'phase3: multi-token match',
+                    student_id + 1, self.student_vocab_size,
+                )
                 continue
             teacher_token_ids = teacher_tokenizer.encode(text, add_special_tokens=False)
             seq_length = len(teacher_token_ids)
@@ -409,7 +470,16 @@ class CrossTokenLoss(Loss):
                     student_indices.append(student_id)
                     teacher_indices.append(t_id)
                     values.append(weight)
+            _progress(
+                'phase3: multi-token match',
+                student_id + 1, self.student_vocab_size,
+            )
 
+        print(
+            f"[CrossToken]  [teacher {teacher_index}] converting "
+            f"{len(student_indices)} mappings to tensors on {self.device} ...",
+            flush=True,
+        )
         student_tensor = torch.tensor(student_indices, dtype=torch.long, device=self.device)
         teacher_tensor = torch.tensor(teacher_indices, dtype=torch.long, device=self.device)
         values_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
@@ -418,7 +488,11 @@ class CrossTokenLoss(Loss):
         self.projection_teacher_indices_list.append(teacher_tensor)
         self.projection_values_list.append(values_tensor)
 
-        print(f"[CrossToken] Teacher {teacher_index}: {len(student_indices)} mappings")
+        print(
+            f"[CrossToken] Teacher {teacher_index}: {len(student_indices)} mappings "
+            f"({time.perf_counter() - _build_start:.1f}s)",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Loss computation
@@ -1279,7 +1353,15 @@ class CrossTokenLoss(Loss):
 
     def get_mapping_statistics(self, teacher_index: int = 0) -> Dict:
         """Return statistics about the projection matrix."""
+        print(
+            '[CrossToken] get_mapping_statistics: '
+            'ensuring projection matrices ...', flush=True,
+        )
         self._ensure_projection_matrices_built()
+        print(
+            '[CrossToken] projection matrices ready, '
+            'computing statistics ...', flush=True,
+        )
         if teacher_index >= len(self.projection_student_indices_list):
             raise ValueError(f"No projection matrix for teacher {teacher_index}")
 
