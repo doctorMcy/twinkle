@@ -41,6 +41,10 @@ Environment variables (all optional):
     MODEL_GPUS                – GPUs for student model (default: 1)
     STUDENT_SAMPLER_GPUS      – GPUs for student vLLM sampler (default: 1)
     TEACHER_GPUS              – GPUs for teacher model (default: 1)
+    DEVICE_IDS                – Comma-separated physical device ids, e.g. 0,2,4,6.
+                                Ranks are mapped to these cards in order
+                                (groups take the first MODEL_GPUS / next
+                                STUDENT_SAMPLER_GPUS / last TEACHER_GPUS ids).
     BATCH_SIZE                – Global batch size (default: 2)
     MAX_STEPS                 – Total optimisation steps (default: 5)
     LR                        – Learning rate (default: 1e-5)
@@ -79,8 +83,8 @@ from twinkle.sampler import vLLMSampler
 logger = get_logger()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', '/model/Qwen3-0.6B')
-TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', '/nas/disk1/Qwen3-1.7B')
+STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', '/nas/disk1/Qwen3-1.7B')
+TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', '/nas/disk1/Llama-3.2-3B-Instruct')
 DATASET_ID = os.environ.get(
     'DATASET_ID', '/root/twinkle/cookbook/rl/mopd/data.jsonl'
 )
@@ -89,6 +93,30 @@ MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 1))
 STUDENT_SAMPLER_GPUS = int(os.environ.get('STUDENT_SAMPLER_GPUS', 1))
 TEACHER_GPUS = int(os.environ.get('TEACHER_GPUS', 1))
 NUM_GPUS = MODEL_GPUS + STUDENT_SAMPLER_GPUS + TEACHER_GPUS
+
+# Optional: specify physical device ids (e.g. DEVICE_IDS=0,2,4,6). Must be set
+# before twinkle.initialize() so the Ray workers inherit the platform's
+# visible-devices env var (ASCEND_RT_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES),
+# which maps local rank -> physical card.
+DEVICE_IDS = os.environ.get('DEVICE_IDS', '4，6，7')
+if DEVICE_IDS:
+    # 兼容中文全角逗号与空格（如 DEVICE_IDS=4，6，7），并尽早校验格式
+    DEVICE_IDS = DEVICE_IDS.replace('，', ',').replace(' ', '')
+    try:
+        [int(d) for d in DEVICE_IDS.split(',') if d]
+    except ValueError as exc:
+        raise ValueError(
+            f'Invalid DEVICE_IDS={DEVICE_IDS!r}: must be comma-separated integers'
+        ) from exc
+    from twinkle.utils.platforms import Platform
+    visible_env = Platform.get_platform().visible_device_env()
+    old = os.environ.get(visible_env)
+    if old and old != DEVICE_IDS:
+        logger.warning(
+            f'Overriding {visible_env}={old!r} with DEVICE_IDS={DEVICE_IDS!r}'
+        )
+    os.environ[visible_env] = DEVICE_IDS
+    logger.info(f'Setting {visible_env}={DEVICE_IDS} (from DEVICE_IDS)')
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
 MAX_STEPS = int(os.environ.get('MAX_STEPS', 5))
@@ -378,6 +406,42 @@ def train():
         world_size=TEACHER_GPUS, dp_size=TEACHER_GPUS,
     )
 
+    # Ray 不会自动检测昇腾 NPU 资源：ResourceManager 要求节点上报
+    # NPU 资源数 >= nproc_per_node，否则报
+    # "Not enough resources, required nodes: 1, available: 0"。
+    # 本地启动 Ray 时显式声明 NPU 自定义资源；部分 Ray 版本会忽略
+    # ray.init(resources=...)，此时自动退化到 `ray start --resources` 重启。
+    # 若通过 RAY_ADDRESS 连接外部集群，请在 `ray start` 时声明
+    # --resources='{"NPU": <卡数>}'。
+    import ray
+    if not os.environ.get('RAY_ADDRESS'):
+        ray.init(resources={'NPU': NUM_GPUS}, ignore_reinit_error=True)
+        have_npu = float(ray.cluster_resources().get('NPU', 0))
+        if have_npu < NUM_GPUS:
+            logger.warning(
+                f'ray.init(resources=...) 未生效（NPU: {have_npu:.0f}/{NUM_GPUS}），'
+                '重启本地 Ray 并用 --resources 声明 NPU 资源'
+            )
+            import subprocess
+            subprocess.run(['ray', 'stop'], capture_output=True)
+            subprocess.run(
+                ['ray', 'start', '--head', '--num-gpus=0',
+                 f'--resources={{"NPU": {NUM_GPUS}}}', '--disable-usage-stats',
+                 '--include-dashboard=false'],
+                check=True,
+            )
+            ray.init(address='auto', ignore_reinit_error=True)
+    else:
+        ray.init(ignore_reinit_error=True)
+        have_npu = float(ray.cluster_resources().get('NPU', 0))
+        if have_npu < NUM_GPUS:
+            raise RuntimeError(
+                f'Ray 集群（RAY_ADDRESS={os.environ["RAY_ADDRESS"]}）未声明 '
+                f'NPU 资源（NPU: {have_npu:.0f}，需要 {NUM_GPUS}）。请重启集群：\n'
+                f'  ray stop && ray start --head --num-gpus=0 '
+                f'--resources=\'{{"NPU": {NUM_GPUS}}}\''
+            )
+
     twinkle.initialize(
         mode='ray',
         nproc_per_node=NUM_GPUS,
@@ -569,10 +633,10 @@ def train():
         )
 
         # DEBUG: 完整输出(源文本 + tokenid)
-        print_full_outputs(
-            optim_step, sample_response, teacher_inputs,
-            student_tokenizer, teacher_tokenizer,
-        )
+        # print_full_outputs(
+        #     optim_step, sample_response, teacher_inputs,
+        #     student_tokenizer, teacher_tokenizer,
+        # )
 
         # ── Step 4: Teacher forward → full logits ────────────────────────────
         teacher_outputs = teacher_model.forward_only(
@@ -644,15 +708,15 @@ def train():
         student_outputs = student_outputs()  # remote_function → actual result
 
         # DEBUG: 逐 token 映射关系(学生/教师 tokenid + 概率)
-        print_cross_token_mapping(
-            optim_step,
-            student_outputs['logits'],
-            teacher_logits,
-            student_ids,
-            teacher_input_ids,
-            student_labels,
-            loss_fn,
-        )
+        # print_cross_token_mapping(
+        #     optim_step,
+        #     student_outputs['logits'],
+        #     teacher_logits,
+        #     student_ids,
+        #     teacher_input_ids,
+        #     student_labels,
+        #     loss_fn,
+        # )
 
         student_model.clip_grad_and_step(adapter_name=ADAPTER_NAME)
 

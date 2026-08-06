@@ -608,14 +608,16 @@ class CrossTokenLoss(Loss):
         else:
             loss = self.kl_loss_weight * total_kd + self.ce_loss_weight * ce_loss
 
-        # Compute number of valid tokens
+        # Compute number of valid tokens. Return as a tensor (not an int) to
+        # match the LossOutput convention: calculate_loss divides num_tokens by
+        # dp_world_size and calls .item() on it (see CrossEntropyLoss).
         loss_mask = (labels != -100).float()
-        num_tokens = int(loss_mask.sum().item())
+        num_tokens = loss_mask.sum().clamp(min=1)
 
         # Print metrics
         print(f"\n=== CrossTokenLoss (type={self.loss_type}) ===")
         print(f"  KD loss: {total_kd.item():.6f}  CE loss: {ce_loss.item():.6f}")
-        print(f"  Total loss: {loss.item():.6f}  num_tokens: {num_tokens}")
+        print(f"  Total loss: {loss.item():.6f}  num_tokens: {int(num_tokens)}")
         for m in teacher_metrics:
             idx = m['index']
             print(f"  Teacher {idx} (w={m['weight']:.3f}): kd={m['kd_loss']:.6f}")
@@ -848,6 +850,48 @@ class CrossTokenLoss(Loss):
         valid_f = valid_mask.float()
         masked_kl = (per_pos_kl * valid_f).sum() / valid_f.sum().clamp(min=1.0)
         kd_loss = masked_kl * T * T
+
+        # ── DIAGNOSTIC: 学生投影质量点 vs 教师 top-k 覆盖 ─────────────────
+        # 回答“KL 为什么大”:学生投影 argmax 是否落在教师 top-k 内、教师
+        # 是否认可该 token(q>1e-4)。三类结果:
+        #   in_topk & q>1e-4  → 正常(教师认可学生主要质量点)
+        #   in_topk & q<=1e-4 → 切分伪影(教师 top-k 含该 token 但给 ~0,
+        #                        异架构 token 边界不同)
+        #   out_topk           → 切片丢弃(学生质量点不在教师 top-k 内,
+        #                        重归一化后分布被扭曲)
+        # 跨 tokenizer 时预计 in_topk&q>1e-4 占比极低,说明 KL 触底是伪影。
+        with torch.no_grad():
+            diag_proj = proj_C  # [B, C|S, V_t] 学生投影质量
+            diag_q = tgt_C.exp().clamp(min=0.0)  # 教师概率(几何平均近似)
+            proj_argmax = diag_proj.argmax(dim=-1)  # [B, C|S]
+            proj_argmass = diag_proj.max(dim=-1).values  # [B, C|S]
+            topk_mask = torch.zeros(
+                tkr_vocab_size, dtype=torch.bool, device=self.device,
+            )
+            topk_mask[topk_idx] = True
+            in_topk = topk_mask[proj_argmax]  # [B, C|S]
+            q_argmax = diag_q.gather(
+                dim=-1, index=proj_argmax.unsqueeze(-1)
+            ).squeeze(-1)  # [B, C|S]
+            q_ok = q_argmax > 1e-4
+            diag_valid = valid_mask.bool()
+            n_diag = int(diag_valid.sum().item())
+            if n_diag > 0:
+                n_in_topk = int((in_topk & diag_valid).sum().item())
+                n_q_ok = int((in_topk & q_ok & diag_valid).sum().item())
+                n_q_low = int((in_topk & ~q_ok & diag_valid).sum().item())
+                n_out = n_diag - n_in_topk
+                mean_mass = float(
+                    (proj_argmass * diag_valid).sum().item() / n_diag
+                )
+                print(
+                    f"[CrossToken]  [diag] student proj argmax: valid={n_diag}, "
+                    f"in_topk={n_in_topk} ({n_in_topk / n_diag:.1%}), "
+                    f"in_topk&q>1e-4={n_q_ok} ({n_q_ok / n_diag:.1%}), "
+                    f"in_topk&q<=1e-4={n_q_low}, out_topk={n_out} "
+                    f"({n_out / n_diag:.1%}), mean_argmax_mass={mean_mass:.3f}",
+                    flush=True,
+                )
 
         # ── DEBUG: KL 异常位置(散度值最大的 top-N + 阈值统计) ────────────
         # 打印逐位置 KL 最大的 top-N 位置及阈值统计,每行附带与 trainer
