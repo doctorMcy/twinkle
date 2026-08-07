@@ -98,7 +98,7 @@ NUM_GPUS = MODEL_GPUS + STUDENT_SAMPLER_GPUS + TEACHER_GPUS
 # before twinkle.initialize() so the Ray workers inherit the platform's
 # visible-devices env var (ASCEND_RT_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES),
 # which maps local rank -> physical card.
-DEVICE_IDS = os.environ.get('DEVICE_IDS', '4，6，7')
+DEVICE_IDS = os.environ.get('DEVICE_IDS', '13，14，15')
 if DEVICE_IDS:
     # 兼容中文全角逗号与空格（如 DEVICE_IDS=4，6，7），并尽早校验格式
     DEVICE_IDS = DEVICE_IDS.replace('，', ',').replace(' ', '')
@@ -130,7 +130,7 @@ BETA = float(os.environ.get('BETA', 0.95))
 GAMMA = float(os.environ.get('GAMMA', 0.1))
 GAMMA_KL = float(os.environ.get('GAMMA_KL', 1.0))
 GAMMA_ULD = float(os.environ.get('GAMMA_ULD', 0.5))
-VOCAB_TOPK = int(os.environ.get('VOCAB_TOPK', 64))
+VOCAB_TOPK = int(os.environ.get('VOCAB_TOPK', 512))
 UNCOMMON_TOPK = int(os.environ.get('UNCOMMON_TOPK', 8192))
 MAX_LENGTH_SEQ = int(os.environ.get('MAX_LENGTH_SEQ', 2048))
 MAX_NEW_TOKENS = int(os.environ.get('MAX_NEW_TOKENS', 2048))
@@ -140,6 +140,10 @@ CE_LOSS_WEIGHT = float(os.environ.get('CE_LOSS_WEIGHT', 1.0))
 DYNAMIC_LOSS_SCALING = os.environ.get(
     'DYNAMIC_LOSS_SCALING', 'false'
 ).lower() in ('true', '1', 'yes')
+# KL 方向:默认 true = 正向 KL(学生‖教师)(Σ p·ln(p/q),对教师低分有
+# 区分度)——反向 KL(教师‖学生)在精确投影 + 教师分布散落时被 eps 地板
+# 放大到 20+,无区分度。NeMo 用反向但配合软投影,我们场景必须正向。
+REVERSE_KL = os.environ.get('REVERSE_KL', 'true').lower() in ('true', '1', 'yes')
 
 ADAPTER_NAME = 'default'
 
@@ -185,7 +189,11 @@ def prepare_teacher_inputs_from_student_gen(
             full_ids = seq.new_input_feature['input_ids']
             text = student_tokenizer.decode(full_ids, skip_special_tokens=False)
 
-            teacher_ids = teacher_tokenizer.encode(text, add_special_tokens=True)
+            # 不加特殊 token:教师序列必须与学生的字符跨度一一对应。
+            # add_special_tokens=True 会给 Llama 加 <|begin_of_text|>(15 字符),
+            # 教师所有字符跨度整体偏移 → chunk 对齐系统性错位
+            # (学生响应区对齐到教师模板区,KL 触底)。
+            teacher_ids = teacher_tokenizer.encode(text, add_special_tokens=False)
             teacher_ids = teacher_ids[:MAX_LENGTH_SEQ]
 
             teacher_inputs.append({
@@ -230,6 +238,37 @@ def print_full_outputs(
             t_ids = teacher_inputs[t_idx]['input_ids']
             t_text = teacher_tokenizer.decode(t_ids, skip_special_tokens=False)
             t_idx += 1
+
+            # ── 文本一致性诊断:长度 / 首个字符差异 / 前 60 token ──────
+            # 用于排查 chunk 对齐错位(教师预测目标与学生目标系统性不对应):
+            # 若 len 不等或 first_char_diff 出现在开头 → BOS/规范化导致跨度漂移。
+            print(f"\n  Sample[{i}].Seq[{j}] ALIGNMENT CHECK:")
+            print(f"    len(student_text)={len(s_text)}  len(teacher_text)={len(t_text)}")
+            min_len = min(len(s_text), len(t_text))
+            first_diff = next(
+                (k for k in range(min_len) if s_text[k] != t_text[k]), None
+            )
+            if first_diff is None and len(s_text) != len(t_text):
+                first_diff = min_len
+            if first_diff is None:
+                print("    first_char_diff=None (student/teacher texts IDENTICAL)")
+            else:
+                print(
+                    f"    first_char_diff={first_diff}  "
+                    f"student={s_text[first_diff:first_diff + 20]!r}  "
+                    f"teacher={t_text[first_diff:first_diff + 20]!r}"
+                )
+            print(f"    student text head: {s_text[:120]!r}")
+            print(f"    teacher text head: {t_text[:120]!r}")
+            print(
+                f"    student tokens[:60]: "
+                f"{[f'{x}({student_tokenizer.decode([x], skip_special_tokens=False)!r})' for x in _as_list(s_ids)[:60]]}"
+            )
+            print(
+                f"    teacher tokens[:60]: "
+                f"{[f'{x}({teacher_tokenizer.decode([x], skip_special_tokens=False)!r})' for x in _as_list(t_ids)[:60]]}"
+            )
+
             print(f"\n  Sample[{i}].Seq[{j}] STUDENT:")
             print(f"    源文本: {s_text}")
             print(f"    tokenid: {_as_list(s_ids)}")
@@ -329,17 +368,12 @@ def print_cross_token_mapping(
             s_text = student_tok.decode([s_token], skip_special_tokens=False)
             p_before = float(student_probs[0, i, s_token].item())
 
-            # Projection match type: 精确 / 多token / 未匹配
+            # Projection match type: 精确 / 多token / 未匹配 (行内最大权重判定,
+            # 归一化后权重不再是 1.0,精确匹配行通常权重最大)
             entries = proj_map.get(s_token, [])
-            exact = [e for e in entries if e[1] == 1.0]
-            multi = [e for e in entries if 0.0 < e[1] < 1.0]
-            if exact:
-                t_star, _ = exact[0]
-                match_type = '精确'
-                p_after = float(projected[0, i, t_star].item())
-            elif multi:
-                t_star, _ = multi[0]  # first mapping = highest weight (β)
-                match_type = '多token'
+            if entries:
+                t_star, w_star = max(entries, key=lambda e: e[1])
+                match_type = '精确' if w_star >= 0.5 else '多token'
                 p_after = float(projected[0, i, t_star].item())
             else:
                 t_star = None
@@ -500,6 +534,7 @@ def train():
         gamma_uld=GAMMA_ULD,
         vocab_topk=VOCAB_TOPK,
         uncommon_topk=UNCOMMON_TOPK,
+        reverse_kl=REVERSE_KL,
         kl_loss_weight=KL_LOSS_WEIGHT,
         ce_loss_weight=CE_LOSS_WEIGHT,
         dynamic_loss_scaling=DYNAMIC_LOSS_SCALING,
@@ -688,15 +723,16 @@ def train():
             'teacher_labels': [student_labels],
         }
 
-        # DEBUG: Log shapes
-        print(f"\n[Step {optim_step}] Data shapes:")
-        print(f"  input_data samples: {len(input_data)}")
-        print(f"  teacher_logits: {teacher_logits.shape}")
-        print(f"  student_labels: {student_labels.shape}")
-        print(
-            f"  student_labels non-(-100): "
-            f"{(student_labels != -100).sum().item()}"
-        )
+        # DEBUG: Log shapes (XTOKEN_DEBUG_SHAPES=1 时打印,默认关闭)
+        if os.environ.get('XTOKEN_DEBUG_SHAPES', '0') == '1':
+            print(f"\n[Step {optim_step}] Data shapes:")
+            print(f"  input_data samples: {len(input_data)}")
+            print(f"  teacher_logits: {teacher_logits.shape}")
+            print(f"  student_labels: {student_labels.shape}")
+            print(
+                f"  student_labels non-(-100): "
+                f"{(student_labels != -100).sum().item()}"
+            )
 
         # ── Step 6: Student forward + CrossToken backward ────────────────────
         student_outputs = student_model.forward_backward(
