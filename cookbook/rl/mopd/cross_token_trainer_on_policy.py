@@ -144,6 +144,10 @@ DYNAMIC_LOSS_SCALING = os.environ.get(
 # 区分度)——反向 KL(教师‖学生)在精确投影 + 教师分布散落时被 eps 地板
 # 放大到 20+,无区分度。NeMo 用反向但配合软投影,我们场景必须正向。
 REVERSE_KL = os.environ.get('REVERSE_KL', 'true').lower() in ('true', '1', 'yes')
+# 短生成过滤:生成 token 数 < MIN_GEN_TOKENS 的样本跳过训练。
+# 短生成(1-2 个模板 token)产生无信号噪声步(proj_mass=0 → KD/CE≈0 微负),
+# 也是学生"提前停止"逃避教师评价的路径——过滤后该行为不再获得训练信号。
+MIN_GEN_TOKENS = int(os.environ.get('MIN_GEN_TOKENS', 5))
 
 ADAPTER_NAME = 'default'
 
@@ -655,17 +659,43 @@ def train():
             ),
         )
 
+        # ── Step 2.5: 过滤短生成样本 ────────────────────────────────────
+        # 生成 < MIN_GEN_TOKENS 的样本跳过(噪声步 + 阻止学生"提前停止"
+        # 逃避教师评价——短输出不再获得训练信号)。
+        pairs = [
+            (resp, seq)
+            for resp in sample_response
+            for seq in resp.sequences
+        ]
+        valid_pairs = []
+        for resp, seq in pairs:
+            gen_len = (
+                len(seq.new_input_feature['input_ids'])
+                - len(resp.prompt_token_ids)
+            )
+            valid_pairs.append(gen_len >= MIN_GEN_TOKENS)
+        if not any(valid_pairs):
+            logger.warning(
+                f'[Step {optim_step}] all samples filtered (short generation), '
+                'skipping step'
+            )
+            continue
+
         # Extract generated sequences (prompt + student-generated response)
         input_data = [
             seq.new_input_feature
-            for resp in sample_response
-            for seq in resp.sequences
+            for (resp, seq), v in zip(pairs, valid_pairs)
+            if v
         ]
 
         # ── Step 3: Prepare teacher inputs (decode + re-encode) ──────────────
         teacher_inputs = prepare_teacher_inputs_from_student_gen(
             sample_response, student_tokenizer, teacher_tokenizer,
         )
+        # 与 valid_pairs 同序(resp→seq 遍历),过滤短生成样本
+        teacher_inputs = [
+            t for t, v in zip(teacher_inputs, valid_pairs) if v
+        ]
 
         # DEBUG: 完整输出(源文本 + tokenid)
         # print_full_outputs(
@@ -702,14 +732,15 @@ def train():
         # user/assistant) from dominating the loss.
         student_labels_list = []
         student_ids_list = []
-        for resp in sample_response:
-            for seq in resp.sequences:
-                full_ids = seq.new_input_feature['input_ids']
-                labels = list(full_ids)
-                for p in range(len(resp.prompt_token_ids)):
-                    labels[p] = -100
-                student_labels_list.append(torch.tensor(labels, dtype=torch.long))
-                student_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
+        for (resp, seq), v in zip(pairs, valid_pairs):
+            if not v:
+                continue  # 短生成样本已过滤
+            full_ids = seq.new_input_feature['input_ids']
+            labels = list(full_ids)
+            for p in range(len(resp.prompt_token_ids)):
+                labels[p] = -100
+            student_labels_list.append(torch.tensor(labels, dtype=torch.long))
+            student_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
         student_labels = rnn_utils.pad_sequence(
             student_labels_list, batch_first=True, padding_value=-100,
         )

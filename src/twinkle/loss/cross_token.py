@@ -885,6 +885,9 @@ class CrossTokenLoss(Loss):
 
         valid_f = valid_mask.float()
         masked_kl = (per_pos_kl * valid_f).sum() / valid_f.sum().clamp(min=1.0)
+        # 数值防御:KL 理论 ≥0——短生成步投影质量≈0 时重归一化分布全为
+        # eps 噪声,per_pos_kl 可能微负(-1e-3 量级),归零避免负 loss
+        masked_kl = masked_kl.clamp(min=0.0)
         kd_loss = masked_kl * T * T
 
         # ── DIAGNOSTIC: 学生投影质量点 vs 教师 top-k 覆盖 ─────────────────

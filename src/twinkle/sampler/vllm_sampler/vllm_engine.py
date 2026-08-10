@@ -424,6 +424,8 @@ class VLLMEngine(BaseSamplerEngine):
 
         from twinkle.sampler.vllm_sampler.vllm_worker_extension import VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH
         loaded = await self.engine.list_loras()
+        # 诊断:LoRA 是否真正加载进 vLLM(sync 生效性验证)
+        print(f"[CrossToken] vLLM list_loras: {loaded}", flush=True)
         if VLLM_LORA_INT_ID in loaded:
             self._synced_lora_request = LoRARequest(
                 lora_name=VLLM_LORA_NAME,

@@ -460,6 +460,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         """
         engine = self._get_or_create_checkpoint_engine()
 
+        # 诊断:LoRA-only 同步是否真的发生(peft_config 为空则跳过 LoRA 加载)
+        print(
+            f"[CrossToken] receive_weights: base_sync_done={base_sync_done}, "
+            f"peft_config={'non-empty' if peft_config else 'EMPTY'}",
+            flush=True,
+        )
+
         async def _receive_and_load():
             # Stream NCCL-received tensors directly into vLLM via IPC.
             # VLLMEngine.update_weights accepts an async generator and
