@@ -10,6 +10,7 @@ StopReason = Literal['length', 'stop', 'abort', 'error']
 @dataclass
 class SamplingParams:
     max_tokens: Optional[int] = None
+    min_tokens: Optional[int] = None
     seed: Optional[int] = None
     stop: Union[str, Sequence[str], Sequence[int], None] = None
     temperature: float = 1.0
@@ -34,30 +35,40 @@ class SamplingParams:
         if not isinstance(self.top_k, int):
             raise ValueError(f'top_k must be an int, got {type(self.top_k)}')
         if self.top_k != -1 and self.top_k < 1:
-            raise ValueError(f'top_k must be -1 or >= 1, got {self.top_k}')
+            raise ValueError(f'top_k must be -1 or >= 1, got {type(self.top_k)}')
 
         if self.logprobs is not None:
             if not isinstance(self.logprobs, int):
                 raise ValueError(f'logprobs must be an int or None, got {type(self.logprobs)}')
             if self.logprobs < 0:
-                raise ValueError(f'logprobs must be >= 0, got {self.logprobs}')
+                raise ValueError(f'logprobs must be >= 0, got {type(self.logprobs)}')
 
         if self.prompt_logprobs is not None:
             if not isinstance(self.prompt_logprobs, int):
                 raise ValueError(f'prompt_logprobs must be an int or None, got {type(self.prompt_logprobs)}')
             if self.prompt_logprobs < 0:
-                raise ValueError(f'prompt_logprobs must be >= 0, got {self.prompt_logprobs}')
+                raise ValueError(f'prompt_logprobs must be >= 0, got {type(self.prompt_logprobs)}')
 
         if not isinstance(self.num_samples, int):
             raise ValueError(f'num_samples must be an int, got {type(self.num_samples)}')
         if self.num_samples < 1:
-            raise ValueError(f'num_samples must be >= 1, got {self.num_samples}')
+            raise ValueError(f'num_samples must be >= 1, got {type(self.num_samples)}')
 
         if self.max_tokens is not None:
             if not isinstance(self.max_tokens, int):
                 raise ValueError(f'max_tokens must be an int or None, got {type(self.max_tokens)}')
             if self.max_tokens < 0:
                 raise ValueError(f'max_tokens must be >= 1, got {self.max_tokens}')
+
+        if self.min_tokens is not None:
+            if not isinstance(self.min_tokens, int):
+                raise ValueError(f'min_tokens must be an int or None, got {type(self.min_tokens)}')
+            if self.min_tokens < 0:
+                raise ValueError(f'min_tokens must be >= 0, got {self.min_tokens}')
+            if self.max_tokens is not None and self.min_tokens > self.max_tokens:
+                raise ValueError(
+                    f'min_tokens ({self.min_tokens}) must be <= max_tokens ({self.max_tokens})'
+                )
 
         if not isinstance(self.repetition_penalty, (int, float)):
             raise ValueError(f'repetition_penalty must be a number, got {type(self.repetition_penalty)}')
@@ -78,6 +89,9 @@ class SamplingParams:
 
         if self.max_tokens is not None:
             kwargs['max_tokens'] = self.max_tokens
+
+        if self.min_tokens is not None:
+            kwargs['min_tokens'] = self.min_tokens
 
         if self.seed is not None:
             kwargs['seed'] = self.seed

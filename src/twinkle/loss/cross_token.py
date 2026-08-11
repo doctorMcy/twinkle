@@ -44,9 +44,9 @@ from twinkle.loss.base import Loss
 # ------------------------------------------------------------------
 
 def _chunk_average_log_probs(
-    log_probs: torch.Tensor,
-    chunk_id: torch.Tensor,
-    max_chunks: int,
+        log_probs: torch.Tensor,
+        chunk_id: torch.Tensor,
+        max_chunks: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Average ``log_probs`` over chunks defined by ``chunk_id``.
 
@@ -73,6 +73,7 @@ def _chunk_average_log_probs(
     eps = 1e-10
     chunk_log_probs = chunk_sums / (chunk_sizes.unsqueeze(-1) + eps)
     return chunk_log_probs, chunk_sizes
+
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
@@ -118,26 +119,26 @@ class CrossTokenLoss(Loss):
     require_logits = True
 
     def __init__(
-        self,
-        student_tokenizer: 'PreTrainedTokenizer',
-        teacher_tokenizer_group: list,
-        teacher_weights: Optional[list] = None,
-        max_length: int = 4,
-        beta: float = 0.95,
-        gamma: float = 0.1,
-        loss_type: str = 'pkl',
-        temperature: float = 1.0,
-        gamma_kl: float = 1.0,
-        gamma_uld: float = 0.5,
-        vocab_topk: int = 512,
-        uncommon_topk: int = 8192,
-        reverse_kl: bool = False,
-        exact_token_match_only: bool = False,
-        kl_loss_weight: float = 1.0,
-        ce_loss_weight: float = 1.0,
-        dynamic_loss_scaling: bool = False,
-        projection_topk: int = 8,
-        device: Optional[torch.device] = None,
+            self,
+            student_tokenizer: 'PreTrainedTokenizer',
+            teacher_tokenizer_group: list,
+            teacher_weights: Optional[list] = None,
+            max_length: int = 4,
+            beta: float = 0.95,
+            gamma: float = 0.1,
+            loss_type: str = 'pkl',
+            temperature: float = 1.0,
+            gamma_kl: float = 1.0,
+            gamma_uld: float = 0.5,
+            vocab_topk: int = 512,
+            uncommon_topk: int = 8192,
+            reverse_kl: bool = False,
+            exact_token_match_only: bool = False,
+            kl_loss_weight: float = 1.0,
+            ce_loss_weight: float = 1.0,
+            dynamic_loss_scaling: bool = False,
+            projection_topk: int = 8,
+            device: Optional[torch.device] = None,
     ):
         super().__init__()
         self.student_tokenizer = student_tokenizer
@@ -460,7 +461,7 @@ class CrossTokenLoss(Loss):
             teacher_id = None
             if student_id < teacher_vocab_size:
                 if teacher_tokenizer.decode(
-                    [student_id], skip_special_tokens=False
+                        [student_id], skip_special_tokens=False
                 ) == student_token_text:
                     teacher_id = student_id
             if teacher_id is None:
@@ -677,7 +678,7 @@ class CrossTokenLoss(Loss):
         """Convert vLLM top-k logprobs to full-vocab probability tensors."""
         full_group = []
         for i, (topk_lp, topk_idx) in enumerate(
-            zip(topk_logprobs_group, topk_indices_group)
+                zip(topk_logprobs_group, topk_indices_group)
         ):
             vocab_size = self.teacher_vocab_sizes[i]
             batch_size, seq_len, topk = topk_lp.shape
@@ -710,14 +711,14 @@ class CrossTokenLoss(Loss):
     # ------------------------------------------------------------------
 
     def _compute_pkl(
-        self,
-        student_logits: torch.Tensor,
-        teacher_probs: torch.Tensor,
-        labels: torch.Tensor,
-        teacher_index: int,
-        *,
-        student_input_ids: Optional[torch.Tensor] = None,
-        teacher_input_ids: Optional[torch.Tensor] = None,
+            self,
+            student_logits: torch.Tensor,
+            teacher_probs: torch.Tensor,
+            labels: torch.Tensor,
+            teacher_index: int,
+            *,
+            student_input_ids: Optional[torch.Tensor] = None,
+            teacher_input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """NeMo-style projection-KL loss with chunk alignment.
 
@@ -759,14 +760,14 @@ class CrossTokenLoss(Loss):
 
         # ── Chunk alignment (character-span based) ───────────────────────
         use_chunk_alignment = (
-            student_input_ids is not None
-            and teacher_input_ids is not None
-            and self.num_teachers == 1  # multi-teacher alignment is complex
+                student_input_ids is not None
+                and teacher_input_ids is not None
+                and self.num_teachers == 1  # multi-teacher alignment is complex
         )
         if use_chunk_alignment:
             (
-                student_chunk_id,   # [B, Ts-1]  values in [-1, max_chunks)
-                teacher_chunk_id,   # [B, Tt-1]  values in [-1, max_chunks)
+                student_chunk_id,  # [B, Ts-1]  values in [-1, max_chunks)
+                teacher_chunk_id,  # [B, Tt-1]  values in [-1, max_chunks)
                 max_chunks,
             ) = self._build_chunk_ids(
                 student_input_ids, teacher_input_ids, teacher_index,
@@ -804,7 +805,7 @@ class CrossTokenLoss(Loss):
             proj_mass = projected.sum(dim=-1)  # [B, S]
             _masked_mass = proj_mass * loss_mask
             proj_mass_mean = (
-                _masked_mass.sum() / loss_mask.sum().clamp(min=1.0)
+                    _masked_mass.sum() / loss_mask.sum().clamp(min=1.0)
             ).item()
             proj_mass_min = proj_mass[loss_mask.bool()].min().item() if loss_mask.sum() > 0 else 1.0
 
@@ -970,7 +971,7 @@ class CrossTokenLoss(Loss):
                         teacher_index].cpu().float()
                     proj_map = {}
                     for s_, t_, v_ in zip(
-                        s_p.tolist(), t_p.tolist(), v_p.tolist()
+                            s_p.tolist(), t_p.tolist(), v_p.tolist()
                     ):
                         proj_map.setdefault(s_, []).append((t_, v_))
                     self._debug_proj_maps[teacher_index] = proj_map
@@ -987,6 +988,7 @@ class CrossTokenLoss(Loss):
                       '教师对学生tokenid的概率 | 学生tokenId(学生文本) → '
                       '教师tokenId(教师文本) [匹配关系]'
                       ' | p_k(投影目标) q_k(投影目标) t_n(教师位置数)')
+
                 def _fmt_prob(v):
                     """Format a probability; use scientific notation below 1e-4."""
                     if v is None:
@@ -994,6 +996,7 @@ class CrossTokenLoss(Loss):
                     if v >= 1e-4:
                         return f'{v:.4f}'
                     return f'{v:.2e}'
+
                 for kl_val, b_i, c_i in zip(top_kl.tolist(), b_ids, c_ids):
                     s_token = int(shift_labels[b_i, c_i])
                     if s_token == -100:
@@ -1046,7 +1049,7 @@ class CrossTokenLoss(Loss):
                     # 教师对齐位置(chunk 模式:该 chunk 的首个教师位置)
                     if use_chunk_alignment:
                         t_positions = (
-                            teacher_chunk_id[b_i] == c_i
+                                teacher_chunk_id[b_i] == c_i
                         ).nonzero(as_tuple=True)[0]
                         t_pos = (
                             int(t_positions[0].item())
@@ -1116,8 +1119,8 @@ class CrossTokenLoss(Loss):
                     # KL 远大于 p·ln(p/q_k) 的数值矛盾——学生质量点是否
                     # 真的集中在投影目标上)
                     contrib = (
-                        log_projected_k[b_i, c_i].exp()
-                        * (log_projected_k[b_i, c_i] - log_teacher_k[b_i, c_i])
+                            log_projected_k[b_i, c_i].exp()
+                            * (log_projected_k[b_i, c_i] - log_teacher_k[b_i, c_i])
                     )
                     top_contrib, top_cidx = contrib.topk(5)
                     parts = []
@@ -1167,7 +1170,7 @@ class CrossTokenLoss(Loss):
 
     @staticmethod
     def _resolve_alignment_ids(
-        ids_source, index_or_name
+            ids_source, index_or_name
     ) -> Optional[torch.Tensor]:
         """Resolve input_ids from various sources to a [B, S] tensor.
 
@@ -1189,8 +1192,8 @@ class CrossTokenLoss(Loss):
 
     @staticmethod
     def _character_spans(
-        token_ids: torch.Tensor,
-        tokenizer: "PreTrainedTokenizer",
+            token_ids: torch.Tensor,
+            tokenizer: "PreTrainedTokenizer",
     ) -> list:
         """Build ``(start_char, end_char)`` spans for each position.
 
@@ -1218,10 +1221,10 @@ class CrossTokenLoss(Loss):
         return spans_batch
 
     def _build_chunk_ids(
-        self,
-        student_input_ids: torch.Tensor,
-        teacher_input_ids: torch.Tensor,
-        teacher_index: int,
+            self,
+            student_input_ids: torch.Tensor,
+            teacher_input_ids: torch.Tensor,
+            teacher_index: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """Build chunk-id tensors via character-span overlap.
 
@@ -1286,10 +1289,10 @@ class CrossTokenLoss(Loss):
         return s_chunk_id, t_chunk_id, max_chunks
 
     def _project_student_probs(
-        self,
-        student_probs: torch.Tensor,
-        teacher_index: int,
-        teacher_vocab_size: int,
+            self,
+            student_probs: torch.Tensor,
+            teacher_index: int,
+            teacher_vocab_size: int,
     ) -> torch.Tensor:
         """Project student probs [B, S, V_s] to teacher vocab [B, S, V_t] via sparse W."""
         batch_size, seq_len, _ = student_probs.shape
@@ -1327,11 +1330,11 @@ class CrossTokenLoss(Loss):
     # ------------------------------------------------------------------
 
     def _compute_hkl(
-        self,
-        student_logits: torch.Tensor,
-        teacher_probs: torch.Tensor,
-        labels: torch.Tensor,
-        teacher_index: int,
+            self,
+            student_logits: torch.Tensor,
+            teacher_probs: torch.Tensor,
+            labels: torch.Tensor,
+            teacher_index: int,
     ) -> Tuple[torch.Tensor, Dict]:
         """H-KL loss: common-KL + uncommon-L1 + ULD.
 
@@ -1435,10 +1438,10 @@ class CrossTokenLoss(Loss):
         # Weighted combination
         gamma_l1 = max(0.0, 1.0 - self.gamma_kl - self.gamma_uld)
         kd_loss = (
-            self.gamma_kl * common_kl +
-            gamma_l1 * l1_uncommon +
-            self.gamma_uld * uld_loss
-        ) * T * T
+                          self.gamma_kl * common_kl +
+                          gamma_l1 * l1_uncommon +
+                          self.gamma_uld * uld_loss
+                  ) * T * T
 
         # Top-1 accuracy on common subset
         with torch.no_grad():
@@ -1490,7 +1493,7 @@ class CrossTokenLoss(Loss):
         exact_student_ids = (
             self._exact_matched_student_ids[teacher_index]
             if hasattr(self, '_exact_matched_student_ids')
-            and len(self._exact_matched_student_ids) > teacher_index
+               and len(self._exact_matched_student_ids) > teacher_index
             else set()
         )
         exact_matched = len(exact_student_ids)

@@ -86,7 +86,7 @@ logger = get_logger()
 STUDENT_MODEL_ID = os.environ.get('STUDENT_MODEL_ID', '/nas/disk1/Qwen3-1.7B')
 TEACHER_MODEL_ID = os.environ.get('TEACHER_MODEL_ID', '/nas/disk1/Llama-3.2-3B-Instruct')
 DATASET_ID = os.environ.get(
-    'DATASET_ID', '/root/twinkle/cookbook/rl/mopd/data.jsonl'
+    'DATASET_ID', '/model/liujihui/twinkle_client_st/httpserver/models/DG04F8511A00100002/messages.jsonl'
 )
 
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 1))
@@ -119,8 +119,8 @@ if DEVICE_IDS:
     logger.info(f'Setting {visible_env}={DEVICE_IDS} (from DEVICE_IDS)')
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 2))
-MAX_STEPS = int(os.environ.get('MAX_STEPS', 5))
-LEARNING_RATE = float(os.environ.get('LR', 1e-5))
+MAX_STEPS = int(os.environ.get('MAX_STEPS', 100))
+LEARNING_RATE = float(os.environ.get('LR', 2e-5))
 GRADIENT_ACCUMULATION_STEPS = int(os.environ.get('GRADIENT_ACCUMULATION_STEPS', 4))
 
 LOSS_TYPE = os.environ.get('LOSS_TYPE', 'pkl')
@@ -148,6 +148,11 @@ REVERSE_KL = os.environ.get('REVERSE_KL', 'true').lower() in ('true', '1', 'yes'
 # 短生成(1-2 个模板 token)产生无信号噪声步(proj_mass=0 → KD/CE≈0 微负),
 # 也是学生"提前停止"逃避教师评价的路径——过滤后该行为不再获得训练信号。
 MIN_GEN_TOKENS = int(os.environ.get('MIN_GEN_TOKENS', 5))
+# 生成侧强制下限(vLLM min_tokens):生成至少 N 个 token 后才允许 EOS/停止。
+# stop-hacking 的生成侧对策——从源头阻止"早停",不依赖 loss 侧干预。
+# 阈值是"地板"不是"目标":30 低于数据集中最短合理响应(标题类 40-60),
+# 只挡"逃避式"早停,不扭曲正常任务;任务想写长就长,由模型自己决定。
+MIN_NEW_TOKENS = int(os.environ.get('MIN_NEW_TOKENS', 50))
 
 ADAPTER_NAME = 'default'
 
@@ -213,10 +218,40 @@ def _as_list(ids):
         return ids.tolist()
     return list(ids)
 
+def print_generation_summary(
+    optim_step: int,
+    sample_response: list,
+    student_tokenizer,
+) -> None:
+    """打印生成内容摘要:每样本的 prompt 尾 + 响应长度 + 响应文本。
+
+    用于观察在线蒸馏的生成质量/长度分布(不同任务是否输出合理长度的
+    响应,还是"半逃避"的短响应)。受 XTOKEN_DEBUG_GEN=1 控制。
+    """
+    print(f"\n[Step {optim_step}] GENERATION SUMMARY:")
+    for i, resp in enumerate(sample_response):
+        for j, seq in enumerate(resp.sequences):
+            full_ids = _as_list(seq.new_input_feature['input_ids'])
+            prompt_len = len(resp.prompt_token_ids)
+            gen_len = len(full_ids) - prompt_len
+            resp_ids = full_ids[prompt_len:]
+            resp_text = student_tokenizer.decode(
+                resp_ids, skip_special_tokens=False
+            )
+            prompt_text = student_tokenizer.decode(
+                resp.prompt_token_ids, skip_special_tokens=False
+            )
+            print(f"  [{i}.{j}] prompt: ...{prompt_text[-60:]!r}")
+            print(
+                f"       gen_len={gen_len}  response: {resp_text[:250]!r}",
+                flush=True,
+            )
+
 
 def print_full_outputs(
     optim_step: int,
     sample_response: list,
+    valid_pairs: list,
     teacher_inputs: list,
     student_tokenizer,
     teacher_tokenizer,
@@ -325,6 +360,7 @@ def print_cross_token_mapping(
     proj_map = {}
     for s, t, v in zip(s_idx.tolist(), t_idx.tolist(), values.tolist()):
         proj_map.setdefault(s, []).append((t, v))
+
 
     # ── Shift / vocab trim / chunk alignment (same as _compute_pkl) ─────
     shift_labels = labels[..., 1:]
@@ -646,6 +682,7 @@ def train():
 
         # ── Step 1: Sync student weights to sampler ───────────────────────────
         ckpt_manager.sync_weights(merge_and_sync=False)
+
         student_sampler.reset_prefix_cache()
         student_sampler.reset_encoder_cache()
 
@@ -654,10 +691,18 @@ def train():
             batch,
             SamplingParams(
                 max_tokens=MAX_NEW_TOKENS,
+                min_tokens=MIN_NEW_TOKENS,
                 temperature=1.0,
                 num_samples=N_SAMPLES,
             ),
         )
+
+        # DEBUG: 生成内容摘要(响应长度/文本)——观察 stop-hacking 与任务
+        # 合理性(XTOKEN_DEBUG_GEN=1 开启,在过滤前打印全部样本)
+        if os.environ.get('XTOKEN_DEBUG_GEN', '0') == '1':
+            print_generation_summary(
+                optim_step, sample_response, student_tokenizer,
+            )
 
         # ── Step 2.5: 过滤短生成样本 ────────────────────────────────────
         # 生成 < MIN_GEN_TOKENS 的样本跳过(噪声步 + 阻止学生"提前停止"
