@@ -58,4 +58,3 @@ class WorkerPipeline:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
