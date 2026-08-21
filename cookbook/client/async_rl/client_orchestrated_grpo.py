@@ -15,6 +15,8 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle.reward import GSM8KAccuracyReward
+from twinkle.reward_loop import AsyncRewardPipeline, RewardItem
+from twinkle.data_format import user_data_get
 from twinkle_client import DataPlaneClient, init_twinkle_client
 from twinkle_client.async_rl import Worker, WorkerPipeline
 from twinkle_client.common.json_utils import json_safe
@@ -37,6 +39,27 @@ BATCH_SIZE = int(os.environ.get('TWINKLE_BATCH_SIZE', '8'))
 TRAIN_MINI_BATCH_SIZE = int(os.environ.get('TWINKLE_TRAIN_MINI_BATCH_SIZE', '8'))
 MICRO_BATCH_SIZE = int(os.environ.get('TWINKLE_MICRO_BATCH_SIZE', '4'))
 MAX_TOKENS_PER_MICRO_BATCH = int(os.environ.get('TWINKLE_MAX_TOKENS_PER_MICRO_BATCH', '4096'))
+REWARD_NUM_WORKERS = int(os.environ.get('TWINKLE_REWARD_NUM_WORKERS', '2'))
+REWARD_BACKLOG = int(os.environ.get('TWINKLE_REWARD_BACKLOG', '2'))
+REWARD_MODE = os.environ.get('TWINKLE_REWARD_MODE', 'async')
+REWARD_ON_ERROR = os.environ.get('TWINKLE_REWARD_ON_ERROR', 'raise')
+
+
+def _gsm8k_score(data_source, solution_str, ground_truth, extra_info):
+    """Adapt the batch GSM8K reward to reward_loop's scalar contract."""
+    extra_info = extra_info if isinstance(extra_info, dict) else {}
+    prompt = extra_info.get('prompt') or {}
+    prompt = dict(prompt) if isinstance(prompt, dict) else {}
+    messages = list(extra_info.get('messages') or prompt.get('messages') or [])
+    messages.append({'role': 'assistant', 'content': solution_str})
+    trajectory = {**prompt, 'messages': messages}
+    user_data = list(trajectory.get('user_data') or [])
+    existing = user_data_get(user_data, 'ground_truth', None)
+    if existing in (None, ''):
+        user_data.append(('ground_truth', str(ground_truth)))
+    trajectory['user_data'] = user_data
+    value = GSM8KAccuracyReward()([trajectory])[0]
+    return value, {'data_source': data_source}
 
 
 @dataclass(frozen=True)
@@ -254,43 +277,114 @@ class _AdvantageWorker(Worker):
         self.data_plane = data_plane
         self.state = state
         self.source = source
+        self.pipeline = AsyncRewardPipeline(
+            num_workers=REWARD_NUM_WORKERS,
+            mode=REWARD_MODE,
+            backlog=REWARD_BACKLOG,
+            on_error=REWARD_ON_ERROR,
+            worker_kwargs={'compute_score': _gsm8k_score},
+        )
+        self._ready_buffers: dict[int, dict[int, Any]] = {}
+        self._next_ready: dict[int, int] = {}
+        self._partitions: dict[int, _RolloutPartition] = {}
+        self._process_semaphore = asyncio.Semaphore(max(1, REWARD_BACKLOG))
+
+    async def _process(self, result: _RolloutResult) -> None:
+        async with self._process_semaphore:
+            await self._process_inner(result)
+
+    async def _process_inner(self, result: _RolloutResult) -> None:
+        group_id = f'partition-{result.partition.partition_id}/group-{result.group_index}'
+        owned_ref = result.ref
+        try:
+            rows = await self.data_plane.aget(result.ref, fields=['decoded'])
+            if len(rows) != NUM_GENERATIONS:
+                raise RuntimeError(
+                    f'group {group_id} expected {NUM_GENERATIONS} generations, '
+                    f'got {len(rows)}')
+            items = []
+            for index, row in enumerate(rows):
+                messages = list(result.prompt.get('messages') or [])
+                items.append(RewardItem(
+                    item_id=f'{group_id}/sample-{index}',
+                    data_source='gsm8k',
+                    solution_str=row.get('decoded') or '',
+                    ground_truth=str(result.prompt.get('ground_truth') or user_data_get(
+                        result.prompt.get('user_data'), 'ground_truth', '')),
+                    extra_info={'prompt': result.prompt, 'messages': messages},
+                ))
+            handle = await asyncio.to_thread(self.pipeline.submit, items)
+            reward_results = await asyncio.to_thread(self.pipeline.collect, handle)
+            by_index = {}
+            for reward_result in reward_results:
+                try:
+                    sample_index = int(reward_result.item_id.rsplit('/sample-', 1)[1])
+                except (ValueError, IndexError) as error:
+                    raise RuntimeError(f'{group_id} returned malformed reward item_id '
+                                       f'{reward_result.item_id!r}') from error
+                if sample_index in by_index or not 0 <= sample_index < NUM_GENERATIONS:
+                    raise RuntimeError(f'{group_id} returned duplicate or out-of-range '
+                                       f'sample index {sample_index}')
+                by_index[sample_index] = reward_result.reward_score
+            expected_indices = set(range(NUM_GENERATIONS))
+            if set(by_index) != expected_indices:
+                raise RuntimeError(f'{group_id} reward indices mismatch: '
+                                   f'expected {expected_indices}, got {set(by_index)}')
+            rewards = [float(by_index[index]) for index in range(NUM_GENERATIONS)]
+            advantages = await asyncio.to_thread(
+                GRPOAdvantage(), rewards, num_generations=NUM_GENERATIONS)
+            ref = await self.data_plane.aappend(
+                owned_ref,
+                [{'reward': reward, 'advantage': float(advantage)}
+                 for reward, advantage in zip(rewards, advantages)],
+            )
+            owned_ref = ref
+            partition_id = result.partition.partition_id
+            buffer = self._ready_buffers.setdefault(partition_id, {})
+            buffer[result.group_index] = ref
+            next_index = self._next_ready.get(partition_id, 0)
+            while next_index in buffer:
+                ready_ref = buffer.pop(next_index)
+                await result.partition.ready.put(_ReadyGroup(next_index, ready_ref))
+                if ready_ref is owned_ref:
+                    owned_ref = None
+                next_index += 1
+            self._next_ready[partition_id] = next_index
+        except BaseException:
+            if owned_ref is not None:
+                try:
+                    await self.data_plane.arelease(owned_ref)
+                finally:
+                    raise
+            raise
 
     async def run(self) -> None:
+        tasks = []
         try:
             while True:
                 result = await self.source.get()
                 if result is None:
-                    return
-                group_id = f'partition-{result.partition.partition_id}/group-{result.group_index}'
-                try:
-                    rows = await self.data_plane.aget(result.ref, fields=['decoded'])
-                    if len(rows) != NUM_GENERATIONS:
-                        raise RuntimeError(
-                            f'group {group_id} expected {NUM_GENERATIONS} generations, '
-                            f'got {len(rows)}')
-                    trajectories = []
-                    for row in rows:
-                        messages = list(result.prompt.get('messages') or [])
-                        messages.append({'role': 'assistant', 'content': row.get('decoded') or ''})
-                        trajectories.append({**result.prompt, 'messages': messages})
-                    rewards = await asyncio.to_thread(GSM8KAccuracyReward(), trajectories)
-                    advantages = await asyncio.to_thread(
-                        GRPOAdvantage(), rewards, num_generations=NUM_GENERATIONS)
-                    ref = await self.data_plane.aappend(
-                        result.ref,
-                        [{
-                            'reward': float(reward),
-                            'advantage': float(advantage),
-                        } for reward, advantage in zip(rewards, advantages)],
-                    )
-                    await result.partition.ready.put(
-                        _ReadyGroup(result.group_index, ref))
-                except BaseException:
-                    await self.data_plane.arelease(result.ref)
-                    raise
+                    break
+                self._partitions[result.partition.partition_id] = result.partition
+                tasks.append(asyncio.create_task(self._process(result)))
+            await asyncio.gather(*tasks)
         except BaseException as error:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await self.state.fail(error)
             raise
+        finally:
+            for buffer in self._ready_buffers.values():
+                for ref in buffer.values():
+                    try:
+                        await self.data_plane.arelease(ref)
+                    except Exception:
+                        pass
+            await asyncio.to_thread(self.pipeline.close)
+
+
 
 
 class _TrainerWorker(Worker):
@@ -360,10 +454,15 @@ async def run_grpo(
     data_plane: DataPlaneClient,
 ) -> None:
     """Overlap rollout partitions while training and publishing them in FIFO order."""
-    if MAX_STALENESS < 0:
-        raise ValueError('MAX_STALENESS must be non-negative')
-    if min(ROLLOUT_CONCURRENCY, NUM_GENERATIONS, BATCH_SIZE, TRAIN_MINI_BATCH_SIZE) <= 0:
-        raise ValueError('rollout concurrency and all batch sizes must be positive')
+    if MAX_STALENESS < 0 or MAX_PARTITIONS <= 0:
+        raise ValueError('MAX_PARTITIONS must be positive and MAX_STALENESS non-negative')
+    if min(ROLLOUT_CONCURRENCY, NUM_GENERATIONS, BATCH_SIZE, TRAIN_MINI_BATCH_SIZE,
+           REWARD_NUM_WORKERS, REWARD_BACKLOG) <= 0:
+        raise ValueError('concurrency, generation, batch, and reward settings must be positive')
+    if REWARD_MODE not in ('async', 'sync'):
+        raise ValueError("REWARD_MODE must be 'async' or 'sync'")
+    if REWARD_ON_ERROR not in ('raise', 'zero'):
+        raise ValueError("REWARD_ON_ERROR must be 'raise' or 'zero'")
     if TRAIN_MINI_BATCH_SIZE % NUM_GENERATIONS:
         raise ValueError('TRAIN_MINI_BATCH_SIZE must be divisible by NUM_GENERATIONS')
     groups_per_step = TRAIN_MINI_BATCH_SIZE // NUM_GENERATIONS
@@ -373,7 +472,7 @@ async def run_grpo(
     initial = await _submit(model.save, 'policy-0')
     state = _GRPOState(_Policy(version=0, adapter_uri=_checkpoint_path(initial)))
     semaphore = asyncio.Semaphore(ROLLOUT_CONCURRENCY)
-    rollout_results: asyncio.Queue = asyncio.Queue()
+    rollout_results: asyncio.Queue = asyncio.Queue(maxsize=max(1, REWARD_BACKLOG * BATCH_SIZE))
     await WorkerPipeline((
         _RolloutWorker(dataloader, sampler, state, rollout_results, semaphore),
         _AdvantageWorker(data_plane, state, rollout_results),
