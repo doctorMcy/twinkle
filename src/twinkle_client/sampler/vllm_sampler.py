@@ -1,11 +1,34 @@
 import asyncio
-from typing import Any, Dict, List, Optional, Union
+import json
+import queue
+import threading
+from dataclasses import dataclass
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from twinkle_client.http import http_post
+from twinkle_client.http.http_utils import _build_headers
 from twinkle_client.types.sampler import AddAdapterResponse, SampleResponseModel, SetTemplateResponse
 from peft import PeftConfig
 from twinkle.data_format import Trajectory, InputFeature
 from twinkle_client.common.json_utils import json_safe
 from twinkle_client.types.component import DataRef
+
+
+@dataclass
+class StreamSample:
+    """One finished generated sequence received from the streaming endpoint."""
+
+    index: int
+    row: Dict[str, Any]
+    ref: DataRef
+    done: int
+    total: int
+
+
+@dataclass
+class StreamComplete:
+    """Terminal event carrying the fully-filled DataRef."""
+
+    ref: DataRef
 
 
 # Intentionally does NOT subclass ``twinkle.sampler.base.Sampler``: importing
@@ -167,6 +190,93 @@ class vLLMSampler:
             group_ids=group_ids,
             num_samples=num_samples,
         )
+
+    async def stream_sample_to_data_plane(
+        self,
+        inputs: Union[List[Trajectory], List[InputFeature], DataRef],
+        sampling_params: Optional[Dict[str, Any]] = None,
+        *,
+        adapter_name: str = '',
+        adapter_uri: Optional[str] = None,
+        policy_version: int | None = None,
+        group_ids: list[str] | None = None,
+        num_samples: int = 1,
+    ) -> AsyncIterator[Union[StreamSample, StreamComplete]]:
+        """Stream each finished generated sequence as it completes.
+
+        Yields one :class:`StreamSample` per sequence (row layout identical to
+        :meth:`sample_to_data_plane`'s backed rows, with the pre-allocated
+        DataRef in ``sample.ref``) and finally a :class:`StreamComplete`
+        carrying the fully-filled DataRef.  HTTP and event errors raise.
+        """
+        body = {
+            'sampling_params': sampling_params,
+            'adapter_name': adapter_name,
+            'adapter_uri': adapter_uri,
+            'policy_version': policy_version,
+            'group_ids': group_ids,
+            'num_samples': num_samples,
+        }
+        body['input_ref' if isinstance(inputs, DataRef) else 'inputs'] = (
+            inputs.model_dump() if isinstance(inputs, DataRef) else _json_safe(inputs))
+
+        lines: queue.Queue = queue.Queue()
+        sentinel = object()
+
+        def _read() -> None:
+            import requests
+            try:
+                response = requests.post(
+                    f'{self.server_url}/sample_to_data_plane_stream',
+                    json=json_safe(body),
+                    headers=_build_headers(),
+                    stream=True,
+                    timeout=(60, 3600),
+                )
+                if response.status_code != 200:
+                    detail = ''
+                    try:
+                        detail = response.json().get('detail', '') or response.text[:4000]
+                    except Exception:
+                        detail = response.text[:4000]
+                    raise RuntimeError(
+                        f'sample_to_data_plane_stream failed ({response.status_code}): {detail}')
+                for raw in response.iter_lines():
+                    if not raw:
+                        continue
+                    lines.put(raw)
+            except BaseException as error:  # noqa: BLE001
+                lines.put(error)
+            finally:
+                lines.put(sentinel)
+
+        thread = threading.Thread(target=_read, daemon=True)
+        thread.start()
+        try:
+            while True:
+                item = await asyncio.to_thread(lines.get)
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise RuntimeError(f'streaming sample failed: {item}') from None
+                event = json.loads(item)
+                kind = event.get('event')
+                if kind == 'error':
+                    raise RuntimeError(event.get('error', 'unknown streaming error'))
+                if kind == 'progress':
+                    yield StreamSample(
+                        index=event['index'],
+                        row=event['row'],
+                        ref=DataRef(**event['ref']),
+                        done=event['done'],
+                        total=event['total'],
+                    )
+                elif kind == 'ref':
+                    yield StreamComplete(ref=DataRef(**event['ref']))
+                else:
+                    raise RuntimeError(f'unknown streaming event: {kind}')
+        finally:
+            thread.join(timeout=60)
 
     def unload_adapter_paths(self, adapter_paths: list[str]) -> None:
         """Evict policy snapshots that are no longer referenced by this client."""

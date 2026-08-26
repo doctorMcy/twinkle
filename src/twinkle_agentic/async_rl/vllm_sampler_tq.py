@@ -5,11 +5,13 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import Future
 from copy import copy
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +57,9 @@ def _dispatch_generation(
         sliced_args[target[1]] = shard
     else:
         sliced_kwargs[target[1]] = shard
+    # Tell each worker where its prompt shard starts so per-sample completion
+    # indices can be reported in the global sequence index space.
+    sliced_kwargs['_prompt_index_base'] = start
     return tuple(sliced_args), sliced_kwargs
 
 
@@ -114,6 +119,59 @@ class _PromptGroupRolloutStats:
     policy_versions: tuple[int, ...]
 
 
+class _GenerationSubmission:
+    """Tracks per-sequence completion of one client/server generation submission.
+
+    The overall ``future`` keeps the whole-group result for
+    ``collect_generation``; ``_per_sample`` records individual sequences as
+    their asyncio tasks finish so the HTTP service can collect and write rows
+    incrementally.  Completion happens on the sampler's event-loop thread while
+    status/collect calls arrive from Ray worker threads, hence the lock.
+
+    Keys are *global* sequence indices: ``prompt_index_base * num_samples +
+    local_index``, where each DP worker registers with its own prompt shard
+    start so different workers never collide.
+    """
+
+    def __init__(self, future: Future[list[SampleResponse]]):
+        self.future = future
+        self.total = 0
+        self._per_sample: dict[int, SampleResponse] = {}
+        self._lock = threading.Lock()
+
+    def register(self, tasks: list[asyncio.Task], index_base: int) -> None:
+        self.total = len(tasks)
+        self._index_base = index_base
+        for index, task in enumerate(tasks):
+            task.add_done_callback(partial(self._on_sample_done, index))
+
+    def _on_sample_done(self, index: int, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            response = task.result()
+        except Exception:
+            # Whole-group failures surface through the gather() in
+            # ``_generate_inputs``; a single failed sample has no partial row.
+            return
+        with self._lock:
+            self._per_sample[self._index_base + index] = response
+
+    def completed_indices(self) -> list[int]:
+        with self._lock:
+            return sorted(self._per_sample)
+
+    def take(self, indices: list[int]) -> list[tuple[int, SampleResponse]]:
+        """Pop already-completed sample responses, returning ``(index, response)``."""
+        with self._lock:
+            result = []
+            for index in indices:
+                response = self._per_sample.pop(index, None)
+                if response is not None:
+                    result.append((index, response))
+            return result
+
+
 @remote_class()
 class VLLMSamplerTQ(vLLMSampler):
     """vLLM sampler that writes async RL rollout results directly to TransferQueue.
@@ -160,7 +218,7 @@ class VLLMSamplerTQ(vLLMSampler):
         # path. Unlike ``_background_submissions`` above, their results must
         # remain available until SamplerManagement collects them and writes
         # them to the opaque client DataPlane.
-        self._generation_submissions: dict[str, Future[list[SampleResponse]]] = {}
+        self._generation_submissions: dict[str, _GenerationSubmission] = {}
         self.metric_buffer = MetricBuffer()
         self._failure: str | None = None
 
@@ -273,6 +331,7 @@ class VLLMSamplerTQ(vLLMSampler):
         adapter_path: str | None = None,
         *,
         use_base_model: bool = False,
+        _prompt_index_base: int = 0,
     ) -> dict[str, Any]:
         """Submit a CS sampling shard without blocking the Ray actor.
 
@@ -280,6 +339,10 @@ class VLLMSamplerTQ(vLLMSampler):
         :meth:`collect_generation` consumes them. This gives the HTTP
         service the same fast-admission property as the native TQ rollout path
         without exposing PromptGroup or BatchMeta to the client.
+
+        ``_prompt_index_base`` is injected by ``_dispatch_generation`` and
+        places this worker's per-sequence completion indices into the global
+        sequence index space.
         """
         if submission_id in self._generation_submissions:
             raise KeyError(f'generation submission already exists: {submission_id}')
@@ -290,39 +353,63 @@ class VLLMSamplerTQ(vLLMSampler):
                 adapter_name=adapter_name,
                 adapter_path=adapter_path,
                 use_base_model=use_base_model,
+                submission_id=submission_id,
+                prompt_index_base=_prompt_index_base,
             ))
-        self._generation_submissions[submission_id] = future
+        self._generation_submissions[submission_id] = _GenerationSubmission(future)
         return {'submission_id': submission_id, 'status': 'running'}
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def get_generation_status(self, submission_id: str) -> dict[str, Any]:
         """Return this DP worker's submission state without waiting."""
-        future = self._generation_submissions.get(submission_id)
-        if future is None:
+        submission = self._generation_submissions.get(submission_id)
+        if submission is None:
             return {
                 'submission_id': submission_id,
                 'status': 'missing',
                 'error': f'unknown generation submission: {submission_id}',
             }
+        future = submission.future
+        completed_indices = submission.completed_indices()
+        base = {
+            'submission_id': submission_id,
+            'completed_samples': len(completed_indices),
+            'completed_indices': completed_indices,
+            'total_samples': submission.total,
+        }
         if future.cancelled():
-            return {'submission_id': submission_id, 'status': 'cancelled'}
+            return {**base, 'status': 'cancelled'}
         if not future.done():
-            return {'submission_id': submission_id, 'status': 'running'}
+            return {**base, 'status': 'running'}
         error = future.exception()
         if error is not None:
             return {
-                'submission_id': submission_id,
+                **base,
                 'status': 'failed',
                 'error': f'{type(error).__name__}: {error}',
             }
-        return {'submission_id': submission_id, 'status': 'completed'}
+        return {**base, 'status': 'completed'}
+
+    @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
+    def collect_ready_samples(self, submission_id: str, indices: list[int]) -> list[tuple[int, SampleResponse]]:
+        """Consume completed samples identified by global sequence indices.
+
+        Indices are global; each DP worker pops only the ones it owns. Popped
+        samples stay available through ``collect_generation`` because the
+        whole-group future keeps the complete result list independently.
+        """
+        submission = self._generation_submissions.get(submission_id)
+        if submission is None:
+            raise KeyError(f'unknown generation submission: {submission_id}')
+        return submission.take(indices)
 
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
     def collect_generation(self, submission_id: str) -> list[SampleResponse]:
         """Consume completed responses from every DP worker."""
-        future = self._generation_submissions.get(submission_id)
-        if future is None:
+        submission = self._generation_submissions.get(submission_id)
+        if submission is None:
             raise KeyError(f'unknown generation submission: {submission_id}')
+        future = submission.future
         if not future.done():
             raise RuntimeError(f'generation submission is still running: {submission_id}')
         try:
@@ -333,9 +420,10 @@ class VLLMSamplerTQ(vLLMSampler):
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def cancel_generation(self, submission_id: str) -> dict[str, Any]:
         """Cancel and forget one generation submission on every DP worker."""
-        future = self._generation_submissions.pop(submission_id, None)
-        if future is None:
+        submission = self._generation_submissions.pop(submission_id, None)
+        if submission is None:
             return {'submission_id': submission_id, 'status': 'missing'}
+        future = submission.future
         was_done = future.done()
         cancelled = future.cancel()
         if cancelled:
@@ -354,7 +442,11 @@ class VLLMSamplerTQ(vLLMSampler):
         """Cancel all retained CS submissions during replica shutdown."""
         submissions = list(self._generation_submissions.values())
         self._generation_submissions.clear()
-        cancelled = sum(future.cancel() for future in submissions if not future.done())
+        cancelled = sum(
+            submission.future.cancel()
+            for submission in submissions
+            if not submission.future.done()
+        )
         return {'submissions': len(submissions), 'cancelled': cancelled}
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
@@ -384,6 +476,8 @@ class VLLMSamplerTQ(vLLMSampler):
         adapter_name: str,
         adapter_path: str | None,
         use_base_model: bool,
+        submission_id: str | None = None,
+        prompt_index_base: int = 0,
     ) -> list[SampleResponse]:
         """Asynchronous counterpart of ``vLLMSampler.sample`` for CS use."""
         if sampling_params is None:
@@ -401,6 +495,12 @@ class VLLMSamplerTQ(vLLMSampler):
             sampling_params = copy(sampling_params)
             sampling_params.max_tokens = 1
             logprobs_only = True
+
+        num_samples = sampling_params.num_samples
+        per_sequence_params = sampling_params
+        if num_samples > 1:
+            per_sequence_params = copy(sampling_params)
+            per_sequence_params.num_samples = 1
 
         multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
         if is_trajectory:
@@ -422,17 +522,42 @@ class VLLMSamplerTQ(vLLMSampler):
                 logger.warning(f'Failed to pre-load LoRA from {local_adapter_path}, '
                                'sampling will proceed without LoRA')
 
-        return await asyncio.gather(*(
-            self._sample_single(
-                feat,
-                sampling_params,
-                lora_request=lora_request,
-                multi_modal_data=multi_modal_data,
-                logprobs_only=logprobs_only,
-                disable_lora=use_base_model,
-            )
-            for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)
-        ))
+        # Per-sequence generation: each task samples exactly one completion so
+        # finished sequences can be reported upstream the moment they finish.
+        sample_tasks = []
+        for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list):
+            for _ in range(num_samples):
+                sample_tasks.append(asyncio.create_task(self._sample_single(
+                    feat,
+                    per_sequence_params,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                    logprobs_only=logprobs_only,
+                    disable_lora=use_base_model,
+                )))
+        if submission_id is not None:
+            submission = self._generation_submissions.get(submission_id)
+            if submission is not None:
+                submission.register(sample_tasks, index_base=prompt_index_base * num_samples)
+        single_responses = await asyncio.gather(*sample_tasks)
+
+        # Re-group per-sequence responses into one SampleResponse per prompt so
+        # ``collect_generation`` keeps its established shape (sequences ordered
+        # by generation index within each prompt).
+        responses = []
+        for prompt_index in range(len(encoded_inputs)):
+            chunk = single_responses[prompt_index * num_samples:(prompt_index + 1) * num_samples]
+            first = chunk[0]
+            sequences = []
+            for response in chunk:
+                sequences.extend(response.sequences)
+            responses.append(SampleResponse(
+                prompt_token_ids=first.prompt_token_ids,
+                sequences=sequences,
+                prompt_logprobs=first.prompt_logprobs,
+                topk_prompt_logprobs=first.topk_prompt_logprobs,
+            ))
+        return responses
 
     def _on_submission_done(self, submission_id: str):
 

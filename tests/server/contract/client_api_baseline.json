@@ -1084,6 +1084,16 @@
           ]
         }
       },
+      "/twinkle/sample_to_data_plane_stream": {
+        "POST": {
+          "operationId": "sample_to_data_plane_stream_twinkle_sample_to_data_plane_stream_post",
+          "parameters": [],
+          "responses": [
+            "200",
+            "422"
+          ]
+        }
+      },
       "/twinkle/sample_stream": {
         "POST": {
           "operationId": "sample_stream_twinkle_sample_stream_post",

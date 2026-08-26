@@ -23,6 +23,24 @@ def register_data_plane_routes(app: FastAPI, self_fn: Callable[[], 'DataPlaneMan
             tags=body.tags,
         )
 
+    @app.post('/twinkle/create', response_model=types.DataRef)
+    async def create(body: types.DataCreateRequest,
+                     self: DataPlaneManagement = Depends(self_fn)) -> types.DataRef:
+        return await self.store.create(
+            body.size,
+            kind=body.kind,
+        )
+
+    @app.post('/twinkle/put_rows', response_model=types.DataRef)
+    async def put_rows(body: types.DataPutRowsRequest,
+                       self: DataPlaneManagement = Depends(self_fn)) -> types.DataRef:
+        return await self.store.put_rows(
+            body.ref,
+            body.rows,
+            body.indices,
+            tags=body.tags,
+        )
+
     @app.post('/twinkle/get', response_model=types.DataRowsResponse)
     async def get(body: types.DataGetRequest,
                   self: DataPlaneManagement = Depends(self_fn)) -> types.DataRowsResponse:

@@ -58,6 +58,7 @@ class MockSampler:
         stop_reason: str = 'length',
         tool_call_text: str | None = None,
         tool_call_turns: Iterable[int] | None = None,
+        generation_stagger_s: float = 0.0,
         **kwargs: Any,
     ) -> None:
         self.model_id = model_id
@@ -73,6 +74,11 @@ class MockSampler:
         # consulted when tool-call injection is active, so the default path
         # stays fully stateless and deterministic.
         self._round = 0
+        # Client/server generation submissions (``submit_generation`` and
+        # friends). ``generation_stagger_s`` spreads per-sequence completion
+        # over time so the streaming endpoint can be exercised on CPU.
+        self._generation_stagger_s = float(generation_stagger_s)
+        self._mock_submissions: dict[str, dict[str, Any]] = {}
         # Surface (rather than silently swallow) extra ctor kwargs: a real
         # backend signature drift then shows up as a visible DEBUG warning in
         # the mock e2e instead of being discarded without trace.
@@ -170,6 +176,142 @@ class MockSampler:
         """Push streaming deltas to a cross-process Ray queue."""
         from . import stream_to_queue
         stream_to_queue(self, queue, inputs, sampling_params, adapter_name, adapter_path)
+
+    # ----- Client/server generation submissions --------------------------- #
+    #
+    # The real ``VLLMSamplerTQ`` exposes these to admit sampling without
+    # blocking the actor and to collect finished sequences incrementally.
+    # The mock mirrors the surface (with a single worker) so the NDJSON
+    # streaming endpoint can be driven on CPU.
+
+    def submit_generation(
+        self,
+        submission_id: str,
+        inputs: Any,
+        sampling_params: SamplingParams | None = None,
+        adapter_name: str = '',
+        adapter_path: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Generate every sequence deterministically and register the submission."""
+        if submission_id in self._mock_submissions:
+            raise KeyError(f'generation submission already exists: {submission_id}')
+        max_tokens = self._resolve_max_tokens(sampling_params)
+        if max_tokens is None or max_tokens < 1:
+            raise ValueError(f'max_tokens must be >= 1, got {max_tokens!r}')
+        num_samples = int(getattr(sampling_params, 'num_samples', 1) or 1)
+        normalized = self._normalize_inputs(inputs)
+        responses: list[SampleResponse] = []
+        for prompt_idx, pif in enumerate(normalized):
+            sequences = []
+            for sample_idx in range(num_samples):
+                seed = stable_seed(self.model_id, adapter_name, self._seed, prompt_idx, sample_idx)
+                rng = np.random.default_rng(seed)
+                tokens = [int(t) for t in rng.integers(low=0, high=max(1, self._vocab_size), size=max_tokens)]
+                logprobs_per_token = rng.uniform(-2.0, 0.0, size=max_tokens).astype(float).tolist()
+                logprobs = [[(tok, float(lp))] for tok, lp in zip(tokens, logprobs_per_token)]
+                sequences.append(
+                    SampledSequence(
+                        stop_reason=self._stop_reason,
+                        tokens=tokens,
+                        logprobs=logprobs,
+                        decoded=None,
+                        new_input_feature=self._build_new_input_feature(pif, tokens),
+                    ))
+            responses.append(SampleResponse(sequences=sequences))
+        self._mock_submissions[submission_id] = {
+            'responses': responses,
+            'num_samples': num_samples,
+            'prompt_count': len(normalized),
+            'total': len(normalized) * num_samples,
+            'submitted_at': time.monotonic(),
+            'taken': set(),
+            'cancelled': False,
+        }
+        return {'submission_id': submission_id, 'status': 'running'}
+
+    def get_generation_status(self, submission_id: str) -> dict[str, Any]:
+        """Report submission state; ``completed_indices`` grow over time."""
+        submission = self._mock_submissions.get(submission_id)
+        if submission is None:
+            return {
+                'submission_id': submission_id,
+                'status': 'missing',
+                'error': f'unknown generation submission: {submission_id}',
+            }
+        count = self._completed_count(submission)
+        base = {
+            'submission_id': submission_id,
+            'completed_samples': count,
+            'completed_indices': list(range(count)),
+            'total_samples': submission['total'],
+        }
+        if submission['cancelled']:
+            return {**base, 'status': 'cancelled'}
+        if count >= submission['total']:
+            return {**base, 'status': 'completed'}
+        return {**base, 'status': 'running'}
+
+    def collect_ready_samples(
+        self,
+        submission_id: str,
+        indices: list[int],
+    ) -> list[tuple[int, SampleResponse]]:
+        """Pop already-completed sequences as single-sequence responses."""
+        submission = self._mock_submissions.get(submission_id)
+        if submission is None:
+            raise KeyError(f'unknown generation submission: {submission_id}')
+        count = self._completed_count(submission)
+        taken = submission['taken']
+        result = []
+        for index in indices:
+            if index in taken or index >= count or index >= submission['total']:
+                continue
+            taken.add(index)
+            prompt_idx, gen_idx = divmod(index, submission['num_samples'])
+            response = submission['responses'][prompt_idx]
+            sequence = response.sequences[gen_idx]
+            result.append((index, SampleResponse(
+                prompt_token_ids=response.prompt_token_ids,
+                sequences=[sequence],
+                prompt_logprobs=response.prompt_logprobs,
+                topk_prompt_logprobs=response.topk_prompt_logprobs,
+            )))
+        return result
+
+    def collect_generation(self, submission_id: str) -> list[SampleResponse]:
+        """Consume the whole submission once every sequence is completed."""
+        submission = self._mock_submissions.pop(submission_id, None)
+        if submission is None:
+            raise KeyError(f'unknown generation submission: {submission_id}')
+        if self._completed_count(submission) < submission['total']:
+            self._mock_submissions[submission_id] = submission
+            raise RuntimeError(f'generation submission is still running: {submission_id}')
+        return submission['responses']
+
+    def cancel_generation(self, submission_id: str) -> dict[str, Any]:
+        """Cancel and forget one generation submission."""
+        submission = self._mock_submissions.pop(submission_id, None)
+        if submission is None:
+            return {'submission_id': submission_id, 'status': 'missing'}
+        submission['cancelled'] = True
+        return {'submission_id': submission_id, 'status': 'cancelled'}
+
+    def cancel_all_generations(self) -> dict[str, int]:
+        """Cancel all retained CS submissions during replica shutdown."""
+        submissions = len(self._mock_submissions)
+        self._mock_submissions.clear()
+        return {'submissions': submissions, 'cancelled': submissions}
+
+    def _completed_count(self, submission: dict[str, Any]) -> int:
+        """How many sequences have finished so far, based on the stagger knob."""
+        if submission['cancelled']:
+            return 0
+        stagger = self._generation_stagger_s
+        if stagger <= 0:
+            return submission['total']
+        elapsed = time.monotonic() - submission['submitted_at']
+        return min(submission['total'], max(0, int(elapsed / stagger)))
 
     @remote_function()
     def apply_patch(self, patch_cls: Any, **kwargs: Any) -> None:

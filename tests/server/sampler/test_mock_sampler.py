@@ -255,3 +255,67 @@ def test_tool_call_turns_multiple_rounds() -> None:
     inp = InputFeature(input_ids=[1])
     decoded = [s.sample(inp, SamplingParams(max_tokens=1))[0].sequences[0].decoded for _ in range(3)]
     assert decoded == ['TC', None, 'TC']
+
+
+# ---------- Client/server generation submissions ---------------------------- #
+
+
+def test_generation_submission_surface_present() -> None:
+    s = MockSampler('mid')
+    for method in ('submit_generation', 'get_generation_status', 'collect_ready_samples',
+                   'collect_generation', 'cancel_generation', 'cancel_all_generations'):
+        assert callable(getattr(s, method))
+
+
+def test_generation_submission_completes_immediately_by_default() -> None:
+    s = MockSampler('mid')
+    state = s.submit_generation('s1', [{'input_ids': [1, 2]}], SamplingParams(max_tokens=4, num_samples=2))
+    assert state == {'submission_id': 's1', 'status': 'running'}
+
+    status = s.get_generation_status('s1')
+    assert status['status'] == 'completed'
+    assert status['completed_samples'] == 2
+    assert status['completed_indices'] == [0, 1]
+    assert status['total_samples'] == 2
+
+    collected = s.collect_ready_samples('s1', [1, 0])
+    assert [index for index, _response in collected] == [1, 0]
+    assert len(collected[0][1].sequences) == 1
+    assert s.collect_ready_samples('s1', [1, 0]) == []
+    assert s.collect_ready_samples('s1', [99]) == []
+
+    responses = s.collect_generation('s1')
+    assert len(responses) == 1
+    assert len(responses[0].sequences) == 2
+    assert 's1' not in s._mock_submissions
+
+
+def test_generation_submission_staggers_completion_over_time() -> None:
+    import time
+    s = MockSampler('mid', generation_stagger_s=0.05)
+    s.submit_generation('s2', [{'input_ids': [1, 2]}], SamplingParams(max_tokens=4, num_samples=4))
+    assert s.get_generation_status('s2')['completed_samples'] == 0
+    time.sleep(0.08)
+    status = s.get_generation_status('s2')
+    assert status['completed_samples'] == 1
+    assert status['completed_indices'] == [0]
+    time.sleep(0.35)
+    assert s.get_generation_status('s2')['status'] == 'completed'
+    assert s.get_generation_status('s2')['completed_samples'] == 4
+
+
+def test_generation_submission_missing_and_cancel() -> None:
+    s = MockSampler('mid')
+    assert s.get_generation_status('nope')['status'] == 'missing'
+    assert s.cancel_generation('nope')['status'] == 'missing'
+
+    s.submit_generation('s3', [{'input_ids': [1]}], SamplingParams(max_tokens=4))
+    assert s.cancel_generation('s3')['status'] == 'cancelled'
+    assert s.get_generation_status('s3')['status'] == 'missing'
+    with pytest.raises(KeyError, match='unknown generation submission'):
+        s.collect_generation('s3')
+
+    s.submit_generation('s4', [{'input_ids': [1]}], SamplingParams(max_tokens=4))
+    s.submit_generation('s5', [{'input_ids': [1]}], SamplingParams(max_tokens=4))
+    assert s.cancel_all_generations() == {'submissions': 2, 'cancelled': 2}
+    assert s._mock_submissions == {}

@@ -78,6 +78,64 @@ class TQDataRefStore:
         )
         return ref
 
+    async def create(
+        self,
+        size: int,
+        *,
+        kind: str = 'data',
+    ) -> DataRef:
+        """Pre-allocate a DataRef without writing any rows.
+
+        The physical partition and keys are derived from the ref itself, so a
+        ref with ``size`` rows can be filled incrementally via :meth:`put_rows`.
+        """
+        if size < 1:
+            raise ValueError('size must be positive')
+        return DataRef(
+            ref_id=uuid.uuid4().hex,
+            size=size,
+            fields=[],
+            kind=kind,
+            num_tokens=0,
+        )
+
+    async def put_rows(
+        self,
+        ref: DataRef,
+        rows: list[dict[str, Any]],
+        indices: list[int],
+        *,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> DataRef:
+        """Overwrite specific row keys in place, one index per row.
+
+        Every index must be unique and satisfy ``0 <= i < ref.size``.  ``fields``
+        is unioned like :meth:`append`; ``num_tokens`` accumulates the input
+        counts of the written rows (callers must write each index at most once).
+        """
+        if len(rows) != len(indices):
+            raise ValueError(f'row count {len(rows)} does not match index count {len(indices)}')
+        if not rows:
+            raise ValueError('rows must not be empty')
+        if len(set(indices)) != len(indices):
+            raise ValueError('indices must be unique')
+        if any(index < 0 or index >= ref.size for index in indices):
+            raise ValueError(f'index out of range for DataRef size {ref.size}: {indices}')
+        if tags is not None and len(tags) != len(rows):
+            raise ValueError(f'tag count {len(tags)} does not match row count {len(rows)}')
+        import transfer_queue as tq
+        await tq.async_kv_batch_put(
+            keys=[str(index) for index in indices],
+            partition_id=_partition(ref),
+            fields=rows_to_tq_fields(rows),
+            tags=tags,
+        )
+        updates: dict[str, Any] = {
+            'fields': list(dict.fromkeys([*ref.fields, *rows[0].keys()])),
+            'num_tokens': ref.num_tokens + _input_token_count(rows),
+        }
+        return ref.model_copy(update=updates)
+
     async def get(
         self,
         ref: DataRef,
