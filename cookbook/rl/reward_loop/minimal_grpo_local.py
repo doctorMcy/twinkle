@@ -33,6 +33,13 @@ logger = get_logger()
 
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 USE_MEGATRON = os.environ.get('TWINKLE_USE_MEGATRON', '0') == '1'
+# Qwen3.5/3.6 are multimodal (vision tower); other models use the plain
+# chat template.  Override explicitly with TWINKLE_TEMPLATE_CLS when needed.
+_IS_MULTIMODAL_QWEN = 'Qwen3.5' in MODEL_ID or 'Qwen3.6' in MODEL_ID
+TEMPLATE_CLS = os.environ.get(
+    'TWINKLE_TEMPLATE_CLS',
+    'Qwen3_5Template' if _IS_MULTIMODAL_QWEN else 'Template',
+)
 
 MODEL_GPUS = int(os.environ.get('TWINKLE_MODEL_GPUS', '1'))
 SAMPLER_GPUS = int(os.environ.get('TWINKLE_SAMPLER_GPUS', '1'))
@@ -62,8 +69,7 @@ def create_gsm8k_dataset() -> Dataset:
     consumable by ``model.forward_backward``.
     """
     dataset = Dataset(DatasetMeta('ms://modelscope/gsm8k', subset_name='main', split='train'))
-    dataset.set_template('Qwen3_5Template', model_id=MODEL_ID, max_length=400)
-    dataset.map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))
+    dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=400)
     return dataset
 
 
@@ -142,10 +148,11 @@ def main() -> None:
         model = MegatronModel(
             model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model', mixed_precision='bf16')
     else:
-        from transformers import Qwen3_5ForConditionalGeneration
+        # model_cls is intentionally omitted: TransformersModel resolves it
+        # from the checkpoint's ``config.architectures`` (falling back to
+        # AutoModelForCausalLM), so no hard-coded class name is needed.
         model = TransformersModel(
             model_id=MODEL_ID,
-            model_cls=Qwen3_5ForConditionalGeneration,
             device_mesh=model_mesh,
             remote_group='model',
         )
@@ -159,7 +166,7 @@ def main() -> None:
         model.set_lr_scheduler('CosineAnnealingLR', T_max=MAX_STEPS, eta_min=0)
     model.set_loss('GRPOLoss', epsilon=0.2)
     model.set_processor(InputProcessor)
-    model.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    model.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
 
     sampler = vLLMSampler(
         model_id=MODEL_ID,
@@ -172,7 +179,7 @@ def main() -> None:
         device_mesh=sampler_mesh,
         remote_group='sampler',
     )
-    sampler.set_template('Qwen3_5Template', model_id=MODEL_ID)
+    sampler.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
 
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     advantage_fn = GRPOAdvantage()

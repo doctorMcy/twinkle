@@ -288,6 +288,7 @@ python cookbook/rl/reward_loop/minimal_grpo_local.py
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `TWINKLE_MODEL_ID` | `ms://Qwen/Qwen3.5-4B` | 基础模型 |
+| `TWINKLE_TEMPLATE_CLS` | 按模型名自动选择 | template 类名（Qwen3.5/3.6 → `Qwen3_5Template`，其他 → `Template`） |
 | `TWINKLE_MODEL_GPUS` / `TWINKLE_SAMPLER_GPUS` | `1` / `1` | model / sampler 各占 GPU 数 |
 | `TWINKLE_USE_MEGATRON` | `0` | `1` 时用 MegatronModel |
 | `TWINKLE_NUM_GENERATIONS` | `4` | 每个 prompt 生成数 |
@@ -295,6 +296,8 @@ python cookbook/rl/reward_loop/minimal_grpo_local.py
 | `TWINKLE_BATCH_SIZE` / `TWINKLE_MINI_BATCH_SIZE` | `4` / `4` | batch 与 mini-batch |
 | `TWINKLE_REWARD_MODE` | `async` | `async` 双缓冲 / `sync` 提交即收集 |
 | `TWINKLE_REWARD_NUM_WORKERS` / `TWINKLE_REWARD_BACKLOG` | `2` / `2` | reward 并发与在飞批次数 |
+
+**模型类不需要手动指定**：示例不传 `model_cls`，`TransformersModel` 会从模型的 `config.architectures` 自动解析类名（兜底 `AutoModelForCausalLM`），因此各种 Qwen / Llama / 其他架构都能直接跑。仅 template 需要按模型选择（见 `TWINKLE_TEMPLATE_CLS`）。
 
 ### 数据契约说明（重要）
 
