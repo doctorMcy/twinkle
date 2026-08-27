@@ -1,0 +1,704 @@
+"""Benchmark: streaming sampling benefit for GRPO + reward loop (local ray mode).
+
+Runs in the same local process two sampling paths over the *same* prompts and
+weights, then compares them:
+
+- Path A (batch baseline): ``sampler.sample`` returns the whole batch, then all
+  RewardItems are submitted at once; rewards are collected when sampling ends.
+- Path B (streaming): one concurrent remote ``sample([input])`` call per
+  sequence; as each sequence finishes its RewardItem is submitted immediately,
+  so reward computation overlaps with the remaining sequences' generation
+  (local-mode equivalent of ``stream_sample_to_data_plane`` per-sample events).
+
+Correctness is verified on two levels before / during the sweep:
+- Level 1 (deterministic): greedy + fixed seed, both paths must produce
+  identical tokens / logprobs / rewards on the same inputs.
+- Level 2 (semantic): under random sampling, no dropped / duplicated / shuffled
+  items, reward function determinism, and group-mean-zero advantages.
+
+Outputs (JSONL timeline + CSV per-step summary) go to ``BENCH_OUT_DIR``.
+
+Environment knobs: TWINKLE_MODEL_ID / TWINKLE_DATASET_ID / TWINKLE_MODEL_GPUS /
+TWINKLE_SAMPLER_GPUS / TWINKLE_LEARNING_RATE / TWINKLE_ADAPTER_NAME /
+TWINKLE_REWARD_NUM_WORKERS / TWINKLE_REWARD_DELAY_MS / BENCH_RUNS (all|smoke) /
+BENCH_OUT_DIR.
+"""
+from __future__ import annotations
+
+import csv
+import itertools
+import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+
+from peft import LoraConfig
+
+import twinkle
+from twinkle import DeviceMesh, DeviceGroup, get_device_placement, get_logger
+from twinkle.advantage import GRPOAdvantage
+from twinkle.checkpoint_engine import CheckpointEngineManager
+from twinkle.data_format import SamplingParams, user_data_get
+from twinkle.dataloader import DataLoader
+from twinkle.dataset import Dataset, DatasetMeta
+from twinkle.metric import CompletionRewardMetric
+from twinkle.model import TransformersModel
+from twinkle.processor import InputProcessor
+from twinkle.reward import GSM8KAccuracyReward
+from twinkle.reward_loop import AsyncRewardPipeline, RewardItem
+from twinkle.sampler import vLLMSampler
+
+logger = get_logger()
+
+# ---------------------------------------------------------------------------
+# Configuration (env-overridable)
+# ---------------------------------------------------------------------------
+MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
+DATASET_ID = os.environ.get('TWINKLE_DATASET_ID', 'ms://modelscope/gsm8k')
+# Qwen3.5/3.6 are multimodal (vision tower); other models use the plain chat
+# template. Override explicitly with TWINKLE_TEMPLATE_CLS when needed.
+_IS_MULTIMODAL_QWEN = 'Qwen3.5' in MODEL_ID or 'Qwen3.6' in MODEL_ID
+TEMPLATE_CLS = os.environ.get(
+    'TWINKLE_TEMPLATE_CLS',
+    'Qwen3_5Template' if _IS_MULTIMODAL_QWEN else 'Template',
+)
+
+MODEL_GPUS = int(os.environ.get('TWINKLE_MODEL_GPUS', '1'))
+SAMPLER_GPUS = int(os.environ.get('TWINKLE_SAMPLER_GPUS', '1'))
+NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
+
+LEARNING_RATE = float(os.environ.get('TWINKLE_LEARNING_RATE', '1e-5'))
+ADAPTER_NAME = os.environ.get('TWINKLE_ADAPTER_NAME', 'bench-streaming-grpo')
+REWARD_NUM_WORKERS = int(os.environ.get('TWINKLE_REWARD_NUM_WORKERS', '2'))
+REWARD_DELAY_MS = float(os.environ.get('TWINKLE_REWARD_DELAY_MS', '0'))
+# Absolute default: repo-root/results, independent of the working directory.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_SCRIPT_DIR)))
+BENCH_OUT_DIR = os.environ.get('BENCH_OUT_DIR', os.path.join(_REPO_ROOT, 'results'))
+TIMELINE_PATH = os.path.join(BENCH_OUT_DIR, 'bench_timeline.jsonl')
+SUMMARY_PATH = os.path.join(BENCH_OUT_DIR, 'bench_summary.csv')
+BENCH_RUNS = os.environ.get('BENCH_RUNS', 'all')
+
+BASE_STEPS = 6
+SWEEP_STEPS = 4
+
+# Backlog must cover one streaming step's in-flight per-sequence handles.
+MAX_TOTAL_PER_STEP = 4 * 8  # batch=4, gen=8
+REWARD_BACKLOG = MAX_TOTAL_PER_STEP + 2
+
+
+def build_runs() -> List[Dict[str, Any]]:
+    """Run matrix: one base config plus single-variable sweep points."""
+    runs = [
+        dict(name='base', batch=4, gen=4, max_tokens=1024, delay_ms=0, steps=BASE_STEPS),
+        dict(name='gen2', batch=4, gen=2, max_tokens=1024, delay_ms=0, steps=SWEEP_STEPS),
+        dict(name='gen8', batch=4, gen=8, max_tokens=1024, delay_ms=0, steps=SWEEP_STEPS),
+        dict(name='tok512', batch=4, gen=4, max_tokens=512, delay_ms=0, steps=SWEEP_STEPS),
+        dict(name='tok2048', batch=4, gen=4, max_tokens=2048, delay_ms=0, steps=SWEEP_STEPS),
+        dict(name='d200', batch=4, gen=4, max_tokens=1024, delay_ms=200, steps=SWEEP_STEPS),
+        dict(name='d1000', batch=4, gen=4, max_tokens=1024, delay_ms=1000, steps=SWEEP_STEPS),
+    ]
+    if BENCH_RUNS == 'smoke':
+        return [dict(name='smoke', batch=1, gen=2, max_tokens=64, delay_ms=0, steps=1)]
+    if BENCH_RUNS != 'all':
+        names = [r['name'] for r in runs]
+        raise ValueError(f"BENCH_RUNS must be 'all' or 'smoke', got {BENCH_RUNS!r}; known runs: {names}")
+    return runs
+
+
+# ---------------------------------------------------------------------------
+# Timeline instrumentation (thread-safe; reward workers append from threads)
+# ---------------------------------------------------------------------------
+class Timeline:
+    """Monotonic-clock event log shared by the main thread and reward workers."""
+
+    def __init__(self) -> None:
+        self._events: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    def record(self, run: str, path: str, kind: str, step: Optional[int] = None,
+               idx: Optional[int] = None, item_id: Optional[str] = None,
+               value: Optional[float] = None) -> None:
+        event = {
+            'ts': time.perf_counter(), 'run': run, 'path': path, 'kind': kind,
+            'step': step, 'idx': idx, 'item_id': item_id, 'value': value,
+        }
+        with self._lock:
+            self._events.append(event)
+
+    def finalize(self) -> None:
+        """Patch reward-worker events (which don't know run/path) from item_id.
+
+        item_id format: ``{run}/{path}/step-{step}/sample-{idx}``.
+        """
+        for event in self._events:
+            if event['run'] == '__run__' and event['item_id']:
+                parts = event['item_id'].split('/')
+                if len(parts) >= 4:
+                    event['run'] = parts[0]
+                    event['path'] = parts[1]
+                    event['step'] = int(parts[2].split('-')[1]) if parts[2].startswith('step-') else None
+                    event['idx'] = int(parts[3].split('-')[1]) if parts[3].startswith('sample-') else None
+
+    def dump(self, path: str) -> None:
+        self.finalize()
+        with open(path, 'w', encoding='utf-8') as fh:
+            for event in self._events:
+                fh.write(json.dumps(event, ensure_ascii=False) + '\n')
+
+
+TIMELINE = Timeline()
+
+# Current run's reward delay (ms), read by gsm8k_score running in worker threads.
+_current_delay_ms: float = REWARD_DELAY_MS
+_current_delay_lock = threading.Lock()
+
+
+def set_reward_delay(delay_ms: float) -> None:
+    global _current_delay_ms
+    with _current_delay_lock:
+        _current_delay_ms = delay_ms
+
+
+def get_reward_delay() -> float:
+    with _current_delay_lock:
+        return _current_delay_ms
+
+
+# ---------------------------------------------------------------------------
+# Dataset + reward scoring (same contract as minimal_grpo_local.py)
+# ---------------------------------------------------------------------------
+def create_dataset() -> Dataset:
+    """GSM8K dataset WITHOUT ``encode()``; rows stay plain dicts so reward
+    adapters can resolve answers and ground truth directly."""
+    dataset = Dataset(DatasetMeta(DATASET_ID, subset_name='main', split='train'))
+    dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=400)
+    return dataset
+
+
+def _score(data_source: str, solution_str: str, ground_truth: str, extra_info: dict):
+    """Pure scalar reward: 1.0 iff the boxed answer matches ground truth."""
+    prompt = extra_info.get('prompt') if isinstance(extra_info, dict) else {}
+    prompt = dict(prompt) if isinstance(prompt, dict) else {}
+    messages = list(prompt.get('messages') or [])
+    messages.append({'role': 'assistant', 'content': solution_str})
+    trajectory = {**prompt, 'messages': messages}
+    user_data = list(trajectory.get('user_data') or [])
+    if user_data_get(user_data, 'ground_truth', None) in (None, ''):
+        user_data.append(('ground_truth', str(ground_truth)))
+    trajectory['user_data'] = user_data
+    return GSM8KAccuracyReward()([trajectory])[0], {'data_source': data_source}
+
+
+def gsm8k_score(data_source: str, solution_str: str, ground_truth: str, extra_info: dict):
+    """reward_loop worker entry: optional artificial delay + timeline events.
+
+    Workers don't know run/path; Timeline.finalize() patches them from item_id.
+    """
+    item_id = extra_info.get('_bench_item_id') if isinstance(extra_info, dict) else None
+    TIMELINE.record('__run__', '__path__', 'reward_start', item_id=item_id)
+    delay_s = get_reward_delay() / 1000.0
+    if delay_s > 0:
+        time.sleep(delay_s)
+    score, meta = _score(data_source, solution_str, ground_truth, extra_info)
+    TIMELINE.record('__run__', '__path__', 'reward_end', item_id=item_id)
+    return score, meta
+
+
+def _ground_truth(prompt: Dict[str, Any]) -> str:
+    return str(user_data_get(prompt.get('user_data'), 'ground_truth', ''))
+
+
+def make_reward_items(run: str, path: str, prompts: List[Dict[str, Any]],
+                      sequences: List[Any], step: int, num_generations: int) -> List[RewardItem]:
+    """One RewardItem per completed sequence, in prompt-major index order.
+
+    ``sequences`` is a list of (index, SampledSequence) aligned to the expanded
+    prompt copies (index // num_generations -> prompt).
+    """
+    items: List[RewardItem] = []
+    for idx, sequence in sequences:
+        prompt = prompts[idx // num_generations]
+        item_id = f'{run}/{path}/step-{step}/sample-{idx}'
+        items.append(RewardItem(
+            item_id=item_id,
+            data_source='gsm8k',
+            solution_str=sequence.decoded or '',
+            ground_truth=_ground_truth(prompt),
+            extra_info={'prompt': prompt, '_bench_item_id': item_id},
+        ))
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Sampling paths
+# ---------------------------------------------------------------------------
+def _expand(prompts: List[Dict[str, Any]], num_generations: int) -> List[Dict[str, Any]]:
+    return [prompt for prompt in prompts for _ in range(num_generations)]
+
+
+def _seq_tokens(sequence) -> List[int]:
+    return list(sequence.tokens)
+
+
+def _seq_logprobs(sequence) -> List[float]:
+    return [logprob[0][1] for logprob in sequence.logprobs]
+
+
+def _seq_input_feature(sequence):
+    return sequence.new_input_feature
+
+
+def _collect_payload(sequence) -> tuple:
+    return (_seq_input_feature(sequence), _seq_logprobs(sequence), len(sequence.tokens))
+
+
+def sample_batch(sampler, prompts: List[Dict[str, Any]], params: SamplingParams,
+                 num_generations: int) -> List[Any]:
+    """Path A: single batch call; returns one SampledSequence per copy."""
+    responses = sampler.sample(_expand(prompts, num_generations), params, ADAPTER_NAME)
+    return [resp.sequences[0] for resp in responses]
+
+
+def sample_stream(sampler, prompts: List[Dict[str, Any]], params: SamplingParams,
+                  num_generations: int):
+    """Path B: N concurrent per-input calls; yields (index, SampledSequence)
+    as each sequence finishes (order-independent)."""
+    expanded = _expand(prompts, num_generations)
+    with ThreadPoolExecutor(max_workers=len(expanded)) as pool:
+        futures = {pool.submit(sampler.sample, [traj], params, ADAPTER_NAME): idx
+                   for idx, traj in enumerate(expanded)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            response = future.result()[0]
+            yield idx, response.sequences[0]
+
+
+# ---------------------------------------------------------------------------
+# Training step (same as minimal_grpo_local.py)
+# ---------------------------------------------------------------------------
+def train_batch(*, model, advantage_fn, metrics, input_data, old_logps,
+                completion_lengths, rewards, num_generations, micro_batch_size=2) -> None:
+    advantages = advantage_fn(rewards, num_generations=num_generations, scale='group').tolist()
+    metrics.accumulate(completion_lengths=completion_lengths, rewards={'total': rewards})
+    total = len(input_data)
+    for mb_start in range(0, total, micro_batch_size):
+        mb_end = min(mb_start + micro_batch_size, total)
+        model.forward_backward(
+            inputs=input_data[mb_start:mb_end],
+            old_logps=old_logps[mb_start:mb_end],
+            advantages=advantages[mb_start:mb_end],
+            micro_batch_size=micro_batch_size,
+        )
+        model.clip_grad_and_step()
+    log_dict = metrics.calculate()
+    log_dict.update(model.calculate_metric(is_training=True))
+    return advantages, log_dict
+
+
+# ---------------------------------------------------------------------------
+# Correctness checks
+# ---------------------------------------------------------------------------
+def check_semantics(run: str, path: str, step: int, prompts, items, results,
+                    rewards, advantages, num_generations) -> Dict[str, Any]:
+    """Level-2 structural checks; returns a dict of pass/fail booleans."""
+    total = len(prompts) * num_generations
+    checks: Dict[str, Any] = {}
+    checks['item_count'] = len(items) == total
+    ids = [item.item_id for item in items]
+    checks['no_duplicate_ids'] = len(set(ids)) == len(ids)
+    checks['results_aligned'] = len(results) == len(items) and {r.item_id for r in results} == set(ids)
+    checks['reward_count'] = len(rewards) == total
+    checks['advantage_count'] = len(advantages) == total
+    # Group-mean-zero: GRPOAdvantage normalizes each group of num_generations.
+    groups_ok = True
+    for g in range(len(prompts)):
+        group = advantages[g * num_generations:(g + 1) * num_generations]
+        if abs(sum(group)) > 1e-4:
+            groups_ok = False
+    checks['advantage_group_mean_zero'] = groups_ok
+    # Reward-function determinism: re-score the first item without the pipeline.
+    if items:
+        first = items[0]
+        direct, _ = _score('gsm8k', first.solution_str, first.ground_truth, first.extra_info)
+        checks['reward_deterministic'] = abs(direct - results[0].reward_score) < 1e-9
+    ok = all(checks.values())
+    checks['all_ok'] = ok
+    TIMELINE.record(run, path, 'semantic_checks', step=step,
+                    value=1.0 if ok else 0.0, item_id=json.dumps(checks))
+    if not ok:
+        logger.warning(f'[semantic checks failed] run={run} path={path} step={step}: {checks}')
+    return checks
+
+
+def run_level1(sampler, pipeline, prompts, num_generations, max_tokens, run='level1'):
+    """Determinism: greedy + fixed seed, both paths on identical inputs, no
+    training in between. Returns a summary dict of per-check results."""
+    params = SamplingParams(max_tokens=max_tokens, num_samples=1, logprobs=1,
+                            temperature=0.0, seed=0)
+    checks: Dict[str, Any] = {'run': run}
+    path_a = list(sample_batch(sampler, prompts, params, num_generations))
+    # Streaming yields in completion order; sort by input index for comparison.
+    streamed = sorted(sample_stream(sampler, prompts, params, num_generations), key=lambda p: p[0])
+    path_b = [seq for _, seq in streamed]
+    checks['sample_count_equal'] = len(path_a) == len(path_b) == len(prompts) * num_generations
+    n = min(len(path_a), len(path_b))
+
+    max_token_diff = 0
+    token_mismatches = 0
+    max_logprob_diff = 0.0
+    logprob_mismatches = 0
+    decoded_mismatches = 0
+    for i in range(n):
+        ta, tb = _seq_tokens(path_a[i]), _seq_tokens(path_b[i])
+        if ta != tb:
+            token_mismatches += 1
+            shorter = min(len(ta), len(tb))
+            for j in range(shorter):
+                if ta[j] != tb[j]:
+                    break
+            max_token_diff = max(max_token_diff, abs(len(ta) - len(tb)))
+        la, lb = _seq_logprobs(path_a[i]), _seq_logprobs(path_b[i])
+        if la != lb:
+            logprob_mismatches += 1
+            shorter = min(len(la), len(lb))
+            if shorter:
+                diffs = [abs(x - y) for x, y in zip(la[:shorter], lb[:shorter])]
+                max_logprob_diff = max(max_logprob_diff, max(diffs))
+            max_logprob_diff = max(max_logprob_diff, abs(len(la) - len(lb)))
+        if (path_a[i].decoded or '') != (path_b[i].decoded or ''):
+            decoded_mismatches += 1
+    checks['tokens_identical'] = token_mismatches == 0
+    checks['token_mismatches'] = token_mismatches
+    checks['max_token_len_diff'] = max_token_diff
+    checks['logprobs_identical'] = logprob_mismatches == 0
+    checks['logprob_mismatches'] = logprob_mismatches
+    checks['max_logprob_diff'] = max_logprob_diff
+    checks['decoded_identical'] = decoded_mismatches == 0
+    checks['decoded_mismatches'] = decoded_mismatches
+
+    # Reward path must also agree deterministically through the pipeline.
+    def _scored_items(sequences, path_label):
+        seqs = [(i, s) for i, s in enumerate(sequences)]
+        return make_reward_items(run, path_label, prompts, seqs, 0, num_generations)
+    items_a = _scored_items(path_a, 'A')
+    items_b = _scored_items(path_b, 'B')
+    results_a = pipeline.collect(pipeline.submit(items_a))
+    results_b = pipeline.collect(pipeline.submit(items_b))
+    rewards_a = [r.reward_score for r in results_a]
+    rewards_b = [r.reward_score for r in results_b]
+    checks['reward_count_equal'] = len(rewards_a) == len(rewards_b) == n
+    checks['rewards_identical'] = rewards_a == rewards_b
+    if rewards_a == rewards_b and rewards_a:
+        adv_a = GRPOAdvantage()(rewards_a, num_generations=num_generations, scale='group').tolist()
+        adv_b = GRPOAdvantage()(rewards_b, num_generations=num_generations, scale='group').tolist()
+        checks['advantages_identical'] = adv_a == adv_b
+    else:
+        checks['advantages_identical'] = False
+    checks['all_ok'] = all(
+        v is True for k, v in checks.items() if k not in ('run',) and isinstance(v, bool))
+    TIMELINE.record(run, 'both', 'level1_checks', value=1.0 if checks['all_ok'] else 0.0,
+                    item_id=json.dumps(checks))
+    logger.info(f'[Level-1 determinism] {json.dumps(checks, ensure_ascii=False)}')
+    return checks
+
+
+# ---------------------------------------------------------------------------
+# Per-path step loop
+# ---------------------------------------------------------------------------
+def run_path(run_cfg: Dict[str, Any], path: str, sampler, pipeline, model,
+             advantage_fn, metrics, batches: List[List[Dict[str, Any]]],
+             sync_weights) -> List[Dict[str, Any]]:
+    """Run one path over the given batches; returns per-step summary rows."""
+    run = run_cfg['name']
+    num_generations = run_cfg['gen']
+    params = SamplingParams(max_tokens=run_cfg['max_tokens'], num_samples=1,
+                            logprobs=1, temperature=1.0, top_p=0.95)
+    rows: List[Dict[str, Any]] = []
+    metrics.reset()
+    for step, prompts in enumerate(batches):
+        TIMELINE.record(run, path, 'step_start', step=step)
+        t_step0 = time.perf_counter()
+        sync_weights()
+        sampler.reset_prefix_cache()
+
+        if path == 'A':
+            t0 = time.perf_counter()
+            TIMELINE.record(run, path, 'sample_start', step=step)
+            sequences = sample_batch(sampler, prompts, params, num_generations)
+            t_sample = time.perf_counter() - t0
+            TIMELINE.record(run, path, 'sample_end', step=step, value=t_sample)
+            seqs = [(i, s) for i, s in enumerate(sequences)]
+        else:
+            t0 = time.perf_counter()
+            TIMELINE.record(run, path, 'sample_start', step=step)
+            seqs = []
+            for idx, sequence in sample_stream(sampler, prompts, params, num_generations):
+                TIMELINE.record(run, path, 'sample_done', step=step, idx=idx)
+                seqs.append((idx, sequence))
+            t_sample = time.perf_counter() - t0
+            TIMELINE.record(run, path, 'sample_end', step=step, value=t_sample)
+
+        # Submit rewards (A: one batch call; B: one call per finished sequence).
+        t0 = time.perf_counter()
+        if path == 'A':
+            items = make_reward_items(run, path, prompts, seqs, step, num_generations)
+            TIMELINE.record(run, path, 'submit_start', step=step)
+            handle = pipeline.submit(items)
+            TIMELINE.record(run, path, 'submit_end', step=step)
+            handles = [handle]
+        else:
+            items, handles = [], []
+            for idx, sequence in seqs:
+                item_list = make_reward_items(run, path, prompts, [(idx, sequence)], step, num_generations)
+                items.append(item_list[0])
+                TIMELINE.record(run, path, 'submit_start', step=step, idx=idx)
+                handles.append(pipeline.submit(item_list))
+                TIMELINE.record(run, path, 'submit_end', step=step, idx=idx)
+        t_submit = time.perf_counter() - t0
+
+        # Collect all rewards for this step (single-buffer schedule).
+        t0 = time.perf_counter()
+        TIMELINE.record(run, path, 'collect_start', step=step)
+        results = []
+        for handle in handles:
+            results.extend(pipeline.collect(handle))
+        t_collect = time.perf_counter() - t0
+        TIMELINE.record(run, path, 'collect_end', step=step, value=t_collect)
+        by_id = {r.item_id: r for r in results}
+        rewards = [by_id[item.item_id].reward_score for item in items]
+
+        # Train.
+        t0 = time.perf_counter()
+        TIMELINE.record(run, path, 'train_start', step=step)
+        payloads = [_collect_payload(seq) for _, seq in seqs]
+        advantages, log_dict = train_batch(
+            model=model, advantage_fn=advantage_fn, metrics=metrics,
+            input_data=[p[0] for p in payloads], old_logps=[p[1] for p in payloads],
+            completion_lengths=[p[2] for p in payloads], rewards=rewards,
+            num_generations=num_generations,
+        )
+        t_train = time.perf_counter() - t0
+        TIMELINE.record(run, path, 'train_end', step=step, value=t_train)
+
+        checks = check_semantics(run, path, step, prompts, items, results, rewards,
+                                 advantages, num_generations)
+
+        t_total = time.perf_counter() - t_step0
+        TIMELINE.record(run, path, 'step_end', step=step, value=t_total)
+        row = dict(run=run, path=path, step=step, batch=len(prompts),
+                   gen=num_generations, max_tokens=run_cfg['max_tokens'],
+                   delay_ms=run_cfg['delay_ms'],
+                   t_sample=t_sample, t_submit=t_submit, t_collect=t_collect,
+                   t_train=t_train, t_total=t_total,
+                   seq_per_s=(len(prompts) * num_generations) / t_total,
+                   semantic_ok=checks['all_ok'])
+        rows.append(row)
+        logger.info(f"[{run}/{path}] step={step} t_sample={t_sample:.2f}s "
+                    f"t_submit={t_submit:.2f}s t_collect={t_collect:.2f}s "
+                    f"t_train={t_train:.2f}s t_total={t_total:.2f}s "
+                    f"reward_mean={sum(rewards) / len(rewards):.4f} {log_dict}")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    runs = build_runs()
+    os.makedirs(BENCH_OUT_DIR, exist_ok=True)
+
+    device_groups = [
+        DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
+        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+    ]
+    model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+    sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
+    twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups,
+                       lazy_collect=False)
+
+    lora_config = LoraConfig(
+        target_modules=[
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+            'in_proj_qkv', 'in_proj_z', 'in_proj_a', 'in_proj_b', 'out_proj',
+        ],
+        r=32, lora_alpha=64, lora_dropout=0.05,
+    )
+    model = TransformersModel(model_id=MODEL_ID, device_mesh=model_mesh, remote_group='model')
+    model.add_adapter_to_model(ADAPTER_NAME, lora_config, gradient_accumulation_steps=1)
+    model.set_optimizer('AdamW', lr=LEARNING_RATE)
+    model.set_lr_scheduler('CosineAnnealingLR', T_max=200, eta_min=0)
+    model.set_loss('GRPOLoss', epsilon=0.2)
+    model.set_processor(InputProcessor)
+    model.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
+
+    sampler = vLLMSampler(
+        model_id=MODEL_ID,
+        engine_args={
+            'gpu_memory_utilization': 0.8,
+            'max_model_len': 4496,
+            'max_lora_rank': 32,
+            'enable_lora': True,
+        },
+        device_mesh=sampler_mesh,
+        remote_group='sampler',
+    )
+    sampler.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
+
+    ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
+    advantage_fn = GRPOAdvantage()
+    metrics = CompletionRewardMetric()
+    pipeline = AsyncRewardPipeline(
+        num_workers=REWARD_NUM_WORKERS,
+        mode='async',
+        backlog=REWARD_BACKLOG,
+        worker_kwargs={'compute_score': gsm8k_score},
+    )
+
+    def sync_weights():
+        ckpt_manager.sync_weights(merge_and_sync=False)
+
+    logger.info(get_device_placement())
+    logger.info(f'[bench] outputs -> {BENCH_OUT_DIR}')
+    summary_rows: List[Dict[str, Any]] = []
+    try:
+        first = runs[0]
+        base_batch = max(1, first['batch'])
+        # Level-1 determinism check on one batch, before any training.
+        # instance_id keeps Ray actor names unique: remote_class derives the
+        # actor name from the caller's source line, so two DataLoaders created
+        # on the same line would collide with ActorAlreadyExistsError.
+        dataloader = DataLoader(
+            dataset=create_dataset, batch_size=base_batch, min_batch_size=base_batch,
+            device_mesh=model_mesh, remote_group='model', instance_id='bench-level1',
+        )
+        one_batch = next(iter(dataloader))
+        prompts = list(one_batch) if isinstance(one_batch, list) else [one_batch]
+        sync_weights()
+        sampler.reset_prefix_cache()
+        level1 = run_level1(sampler, pipeline, prompts, first['gen'], first['max_tokens'])
+        summary_rows.append(dict(run='level1', path='both', step=-1, batch=len(prompts),
+                                 gen=first['gen'], max_tokens=first['max_tokens'],
+                                 delay_ms=0, t_sample=0.0, t_submit=0.0, t_collect=0.0,
+                                 t_train=0.0, t_total=0.0, seq_per_s=0.0,
+                                 semantic_ok=level1['all_ok']))
+        # Persist level-1 results even if a sweep run fails afterwards.
+        flush_outputs(summary_rows)
+
+        for run_cfg in runs:
+            run = run_cfg['name']
+            set_reward_delay(run_cfg['delay_ms'])
+            dataloader = DataLoader(
+                dataset=create_dataset, batch_size=run_cfg['batch'],
+                min_batch_size=run_cfg['batch'],
+                device_mesh=model_mesh, remote_group='model',
+                instance_id=f'bench-{run}',
+            )
+            batches = list(itertools.islice(iter(dataloader), run_cfg['steps']))
+            batches = [list(b) if isinstance(b, list) else [b] for b in batches]
+            logger.info(f'[{run}] materialized {len(batches)} batches x {run_cfg["batch"]} prompts '
+                        f'(gen={run_cfg["gen"]}, max_tokens={run_cfg["max_tokens"]}, '
+                        f'delay={run_cfg["delay_ms"]}ms)')
+            for path in ('A', 'B'):
+                summary_rows.extend(run_path(
+                    run_cfg, path, sampler, pipeline, model, advantage_fn, metrics,
+                    batches, sync_weights))
+            # Persist after every run so a crash keeps all completed runs.
+            flush_outputs(summary_rows)
+    except BaseException:
+        logger.exception('[bench] run failed; flushing partial results before re-raising')
+        flush_outputs(summary_rows)
+        raise
+    finally:
+        pipeline.close()
+
+    logger.info(f'[bench] final outputs: {TIMELINE_PATH}, {SUMMARY_PATH}')
+
+    # Compact console summary: per-run-path means over steps.
+    logger.info('=== benchmark summary (per-run path means) ===')
+    means: Dict[str, Dict[str, float]] = {}
+    for row in summary_rows:
+        if row['step'] < 0:
+            continue
+        key = f"{row['run']}/{row['path']}"
+        bucket = means.setdefault(key, {k: 0.0 for k in
+                                        ('t_sample', 't_submit', 't_collect', 't_train',
+                                         't_total', 'seq_per_s', 'reward_head_start',
+                                         'reward_tail_after_sample', 'n')})
+        for k in ('t_sample', 't_submit', 't_collect', 't_train', 't_total',
+                  'seq_per_s', 'reward_head_start', 'reward_tail_after_sample'):
+            if isinstance(row.get(k), (int, float)):
+                bucket[k] += row[k]
+        bucket['n'] += 1
+    for key, bucket in means.items():
+        n = bucket.pop('n')
+        if n:
+            means[key] = {k: v / n for k, v in bucket.items()}
+            logger.info(f"{key}: " + ' '.join(f'{k}={v:.3f}' for k, v in means[key].items()))
+
+
+def flush_outputs(summary_rows: List[Dict[str, Any]]) -> None:
+    """Write timeline JSONL + summary CSV with data collected so far.
+
+    Safe to call repeatedly (after each run) and from the failure handler:
+    ``Timeline.dump`` patches reward-worker events in place, and the CSV is
+    fully rewritten from ``summary_rows`` each time.
+    """
+    TIMELINE.dump(TIMELINE_PATH)
+    overlap = _aggregate_reward_overlap()
+    with open(SUMMARY_PATH, 'w', newline='', encoding='utf-8') as fh:
+        fieldnames = ['run', 'path', 'step', 'batch', 'gen', 'max_tokens', 'delay_ms',
+                      't_sample', 't_submit', 't_collect', 't_train', 't_total',
+                      'seq_per_s', 'reward_head_start', 'reward_tail_after_sample',
+                      'semantic_ok']
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in summary_rows:
+            key = (row['run'], row['path'], row['step'])
+            if key in overlap:
+                row['reward_head_start'] = overlap[key][0]
+                row['reward_tail_after_sample'] = overlap[key][1]
+            else:
+                row['reward_head_start'] = ''
+                row['reward_tail_after_sample'] = ''
+            writer.writerow(row)
+    logger.info(f'[bench] flushed {len(summary_rows)} summary rows, '
+                f'{len(TIMELINE._events)} timeline events -> {BENCH_OUT_DIR}')
+
+
+def _aggregate_reward_overlap() -> Dict[tuple, tuple]:
+    """Per (run, path, step) -> (reward_head_start, reward_tail_after_sample).
+
+    reward_head_start: time from sampling start to the first reward computation.
+    reward_tail_after_sample: time from sampling end to the last reward ready.
+    Both in seconds; for streaming both shrink as rewards overlap with sampling.
+    """
+    starts: Dict[tuple, float] = {}
+    ends: Dict[tuple, float] = {}
+    rewards: Dict[tuple, List[float]] = {}
+    for event in TIMELINE._events:
+        key = (event['run'], event['path'], event['step'])
+        if key[0] == '__run__' or key[0] == 'level1':
+            continue
+        if event['kind'] == 'sample_start':
+            starts.setdefault(key, event['ts'])
+        elif event['kind'] == 'sample_end':
+            ends.setdefault(key, event['ts'])
+        elif event['kind'] == 'reward_start':
+            rewards.setdefault(key, []).append(event['ts'])
+        elif event['kind'] == 'reward_end':
+            rewards.setdefault(key, []).append(event['ts'])
+    result: Dict[tuple, tuple] = {}
+    for key in set(starts) & set(rewards):
+        r_ts = sorted(rewards[key])
+        head = (r_ts[0] - starts[key]) if len(r_ts) >= 2 else 0.0
+        tail = (r_ts[-1] - ends.get(key, r_ts[-1])) if len(r_ts) >= 2 else 0.0
+        result[key] = (head, tail)
+    return result
+
+
+if __name__ == '__main__':
+    main()
