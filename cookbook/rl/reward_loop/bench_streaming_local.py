@@ -29,6 +29,7 @@ import csv
 import itertools
 import json
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +47,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
+from twinkle.preprocessor.llm import GSM8KProcessor
 from twinkle.reward import GSM8KAccuracyReward
 from twinkle.reward_loop import AsyncRewardPipeline, RewardItem
 from twinkle.sampler import vLLMSampler
@@ -79,6 +81,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_SCRIPT_DIR)))
 BENCH_OUT_DIR = os.environ.get('BENCH_OUT_DIR', os.path.join(_REPO_ROOT, 'results'))
 TIMELINE_PATH = os.path.join(BENCH_OUT_DIR, 'bench_timeline.jsonl')
 SUMMARY_PATH = os.path.join(BENCH_OUT_DIR, 'bench_summary.csv')
+LEVEL1_TEXTS_PATH = os.path.join(BENCH_OUT_DIR, 'level1_texts.json')
 BENCH_RUNS = os.environ.get('BENCH_RUNS', 'all')
 
 BASE_STEPS = 6
@@ -90,7 +93,11 @@ REWARD_BACKLOG = MAX_TOTAL_PER_STEP + 2
 
 
 def build_runs() -> List[Dict[str, Any]]:
-    """Run matrix: one base config plus single-variable sweep points."""
+    """Run matrix: one base config plus single-variable sweep points.
+
+    ``BENCH_RUNS`` accepts 'all', 'smoke', or a comma-separated run-name list
+    (e.g. 'base,gen8,d1000') for targeted reruns.
+    """
     runs = [
         dict(name='base', batch=4, gen=4, max_tokens=1024, delay_ms=0, steps=BASE_STEPS),
         dict(name='gen2', batch=4, gen=2, max_tokens=1024, delay_ms=0, steps=SWEEP_STEPS),
@@ -102,10 +109,16 @@ def build_runs() -> List[Dict[str, Any]]:
     ]
     if BENCH_RUNS == 'smoke':
         return [dict(name='smoke', batch=1, gen=2, max_tokens=64, delay_ms=0, steps=1)]
-    if BENCH_RUNS != 'all':
-        names = [r['name'] for r in runs]
-        raise ValueError(f"BENCH_RUNS must be 'all' or 'smoke', got {BENCH_RUNS!r}; known runs: {names}")
-    return runs
+    if BENCH_RUNS == 'all':
+        return runs
+    names = [r['name'] for r in runs]
+    selected = [name.strip() for name in BENCH_RUNS.split(',') if name.strip()]
+    unknown = [name for name in selected if name not in names]
+    if unknown or not selected:
+        raise ValueError(
+            f"BENCH_RUNS must be 'all', 'smoke', or a comma-separated subset of "
+            f"{names}; got {BENCH_RUNS!r}")
+    return [r for r in runs if r['name'] in selected]
 
 
 # ---------------------------------------------------------------------------
@@ -171,15 +184,45 @@ def get_reward_delay() -> float:
 # Dataset + reward scoring (same contract as minimal_grpo_local.py)
 # ---------------------------------------------------------------------------
 def create_dataset() -> Dataset:
-    """GSM8K dataset WITHOUT ``encode()``; rows stay plain dicts so reward
-    adapters can resolve answers and ground truth directly."""
+    """GSM8K dataset with the same mapping as the server-side examples.
+
+    ``GSM8KProcessor`` builds system+user messages (system prompt demands a
+    ``\\boxed{}`` final answer) and stores the extracted ground truth in
+    ``user_data`` — without it, raw rows carry no ground truth and every
+    reward is 0. Rows stay trajectories (not ``encode()``-d), so the sampler
+    encodes them on the fly and ``messages``/``user_data`` remain available
+    to reward adapters.
+    """
     dataset = Dataset(DatasetMeta(DATASET_ID, subset_name='main', split='train'))
+    dataset.map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))
     dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=400)
     return dataset
 
 
+def _extract_predicted_answer(completion: str) -> str:
+    """Extract the model's answer: \\boxed{} > #### > last number.
+
+    ``GSM8KAccuracyReward.extract_answer`` only recognizes \\boxed{} and ####;
+    models without the boxed instruction emit plain text like
+    ``**Final Answer:** 72 clips.``, so fall back to the last number.
+    """
+    predicted = GSM8KAccuracyReward.extract_answer(completion)
+    if predicted:
+        return predicted
+    tail = completion[-200:] if len(completion) > 200 else completion
+    numbers = re.findall(r'-?\d+(?:[.,]\d+)?', tail)
+    return numbers[-1].replace(',', '') if numbers else ''
+
+
+def _numerically_equal(predicted: str, ground_truth: str) -> bool:
+    try:
+        return abs(float(predicted) - float(str(ground_truth).strip())) < 1e-5
+    except (ValueError, OverflowError):
+        return predicted == str(ground_truth).strip()
+
+
 def _score(data_source: str, solution_str: str, ground_truth: str, extra_info: dict):
-    """Pure scalar reward: 1.0 iff the boxed answer matches ground truth."""
+    """Pure scalar reward: 1.0 iff the extracted answer matches ground truth."""
     prompt = extra_info.get('prompt') if isinstance(extra_info, dict) else {}
     prompt = dict(prompt) if isinstance(prompt, dict) else {}
     messages = list(prompt.get('messages') or [])
@@ -189,7 +232,12 @@ def _score(data_source: str, solution_str: str, ground_truth: str, extra_info: d
     if user_data_get(user_data, 'ground_truth', None) in (None, ''):
         user_data.append(('ground_truth', str(ground_truth)))
     trajectory['user_data'] = user_data
-    return GSM8KAccuracyReward()([trajectory])[0], {'data_source': data_source}
+    reward = GSM8KAccuracyReward()([trajectory])[0]
+    if reward == 0.0 and str(ground_truth).strip():
+        predicted = _extract_predicted_answer(solution_str)
+        if predicted and _numerically_equal(predicted, str(ground_truth).strip()):
+            reward = 1.0
+    return reward, {'data_source': data_source}
 
 
 def gsm8k_score(data_source: str, solution_str: str, ground_truth: str, extra_info: dict):
@@ -207,8 +255,30 @@ def gsm8k_score(data_source: str, solution_str: str, ground_truth: str, extra_in
     return score, meta
 
 
+_ANS_RE = re.compile(r'####\s*(-?\d+(?:[.,]\d+)?)')
+
+
+def _extract_ground_truth_from_answer(answer: Any) -> str:
+    """Extract the final numeric answer from a raw GSM8K row's ``answer`` field.
+
+    Raw rows (no GSM8KProcessor) carry the full solution in ``answer`` ending
+    with ``#### <number>`` (huggingface-style); fall back to the last number.
+    """
+    if not answer:
+        return ''
+    text = str(answer)
+    match = _ANS_RE.search(text)
+    if match:
+        return match.group(1).replace(',', '')
+    numbers = re.findall(r'-?\d+(?:[.,]\d+)?', text)
+    return numbers[-1].replace(',', '') if numbers else ''
+
+
 def _ground_truth(prompt: Dict[str, Any]) -> str:
-    return str(user_data_get(prompt.get('user_data'), 'ground_truth', ''))
+    gt = user_data_get(prompt.get('user_data'), 'ground_truth', '')
+    if gt in (None, ''):
+        gt = _extract_ground_truth_from_answer(prompt.get('answer', ''))
+    return str(gt)
 
 
 def make_reward_items(run: str, path: str, prompts: List[Dict[str, Any]],
@@ -351,15 +421,29 @@ def run_level1(sampler, pipeline, prompts, num_generations, max_tokens, run='lev
     max_logprob_diff = 0.0
     logprob_mismatches = 0
     decoded_mismatches = 0
+    text_pairs = []
     for i in range(n):
         ta, tb = _seq_tokens(path_a[i]), _seq_tokens(path_b[i])
+        first_diff = None
         if ta != tb:
             token_mismatches += 1
             shorter = min(len(ta), len(tb))
             for j in range(shorter):
                 if ta[j] != tb[j]:
+                    first_diff = j
                     break
+            if first_diff is None:
+                first_diff = shorter  # prefix identical, lengths differ
             max_token_diff = max(max_token_diff, abs(len(ta) - len(tb)))
+        text_pairs.append({
+            'idx': i,
+            'tokens_identical': ta == tb,
+            'first_diff_pos': first_diff,
+            'len_a': len(ta),
+            'len_b': len(tb),
+            'a_text': path_a[i].decoded or '',
+            'b_text': path_b[i].decoded or '',
+        })
         la, lb = _seq_logprobs(path_a[i]), _seq_logprobs(path_b[i])
         if la != lb:
             logprob_mismatches += 1
@@ -402,7 +486,28 @@ def run_level1(sampler, pipeline, prompts, num_generations, max_tokens, run='lev
     TIMELINE.record(run, 'both', 'level1_checks', value=1.0 if checks['all_ok'] else 0.0,
                     item_id=json.dumps(checks))
     logger.info(f'[Level-1 determinism] {json.dumps(checks, ensure_ascii=False)}')
+
+    # Dump per-pair texts so divergent pairs can be inspected by hand.
+    _write_level1_texts(prompts, text_pairs, rewards_a, rewards_b, num_generations, checks)
     return checks
+
+
+def _write_level1_texts(prompts, text_pairs, rewards_a, rewards_b, num_generations, checks) -> None:
+    """Write A/B text pairs, rewards and first divergence position per index."""
+    for i, pair in enumerate(text_pairs):
+        prompt = prompts[i // num_generations]
+        pair['ground_truth'] = _ground_truth(prompt)
+        pair['reward_a'] = rewards_a[i] if i < len(rewards_a) else None
+        pair['reward_b'] = rewards_b[i] if i < len(rewards_b) else None
+    record = {
+        'num_pairs': len(text_pairs),
+        'num_generations': num_generations,
+        'level1_checks': {k: v for k, v in checks.items() if k != 'run'},
+        'pairs': text_pairs,
+    }
+    with open(LEVEL1_TEXTS_PATH, 'w', encoding='utf-8') as fh:
+        json.dump(record, fh, ensure_ascii=False, indent=2)
+    logger.info(f'[Level-1] per-pair texts written to {LEVEL1_TEXTS_PATH}')
 
 
 # ---------------------------------------------------------------------------
@@ -432,32 +537,35 @@ def run_path(run_cfg: Dict[str, Any], path: str, sampler, pipeline, model,
             TIMELINE.record(run, path, 'sample_end', step=step, value=t_sample)
             seqs = [(i, s) for i, s in enumerate(sequences)]
         else:
+            # Streaming: submit each sequence's reward the moment it completes,
+            # so reward computation overlaps with the still-running sequences.
             t0 = time.perf_counter()
             TIMELINE.record(run, path, 'sample_start', step=step)
-            seqs = []
+            seqs, items, handles = [], [], []
+            t_submit = 0.0
             for idx, sequence in sample_stream(sampler, prompts, params, num_generations):
                 TIMELINE.record(run, path, 'sample_done', step=step, idx=idx)
                 seqs.append((idx, sequence))
+                item = make_reward_items(run, path, prompts, [(idx, sequence)],
+                                         step, num_generations)[0]
+                items.append(item)
+                t1 = time.perf_counter()
+                TIMELINE.record(run, path, 'submit_start', step=step, idx=idx)
+                handles.append(pipeline.submit([item]))
+                t_submit += time.perf_counter() - t1
+                TIMELINE.record(run, path, 'submit_end', step=step, idx=idx)
             t_sample = time.perf_counter() - t0
             TIMELINE.record(run, path, 'sample_end', step=step, value=t_sample)
 
-        # Submit rewards (A: one batch call; B: one call per finished sequence).
-        t0 = time.perf_counter()
+        # Submit remaining rewards (A: one batch call after sampling).
         if path == 'A':
+            t0 = time.perf_counter()
             items = make_reward_items(run, path, prompts, seqs, step, num_generations)
             TIMELINE.record(run, path, 'submit_start', step=step)
             handle = pipeline.submit(items)
             TIMELINE.record(run, path, 'submit_end', step=step)
+            t_submit = time.perf_counter() - t0
             handles = [handle]
-        else:
-            items, handles = [], []
-            for idx, sequence in seqs:
-                item_list = make_reward_items(run, path, prompts, [(idx, sequence)], step, num_generations)
-                items.append(item_list[0])
-                TIMELINE.record(run, path, 'submit_start', step=step, idx=idx)
-                handles.append(pipeline.submit(item_list))
-                TIMELINE.record(run, path, 'submit_end', step=step, idx=idx)
-        t_submit = time.perf_counter() - t0
 
         # Collect all rewards for this step (single-buffer schedule).
         t0 = time.perf_counter()
@@ -577,6 +685,14 @@ def main() -> None:
         )
         one_batch = next(iter(dataloader))
         prompts = list(one_batch) if isinstance(one_batch, list) else [one_batch]
+        # Diagnostic: confirm the row schema and that ground truths resolve.
+        row0 = prompts[0]
+        preview = json.dumps(row0, ensure_ascii=False, default=str)
+        logger.info(f'[level1 row0] keys={sorted(row0.keys())} '
+                    f'user_data={row0.get("user_data")!r} preview={preview[:300]!r}')
+        for i, p in enumerate(prompts[:3]):
+            logger.info(f'[level1 prompt {i}] gt={_ground_truth(p)!r} '
+                        f'answer={str(p.get("answer", ""))[:60]!r}')
         sync_weights()
         sampler.reset_prefix_cache()
         level1 = run_level1(sampler, pipeline, prompts, first['gen'], first['max_tokens'])
