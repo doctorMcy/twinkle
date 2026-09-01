@@ -35,10 +35,10 @@ reward、ground truth、首个分叉位置，用于人工核对文本差异形�
 
 | 项 | 值 |
 |---|---|
-| 机器 / GPU | 训练机（本地 ray，无 twinkle-server） |
+| 机器 / GPU | 训练机（本地 ray，无 twinkle-server）；昇腾 NPU ×4（`ASCEND_RT_VISIBLE_DEVICES=2,3,4,5`） |
 | 部署模式 | `twinkle.initialize(mode='ray')`，model 1 卡 + sampler 1 卡 |
-| 模型 | 默认 `ms://Qwen/Qwen3.5-4B`（如需可覆盖） |
-| 数据集 | GSM8K train |
+| 模型 | 默认 `ms://Qwen/Qwen3.5-4B`（可覆盖为本地路径） |
+| 数据集 | GSM8K train（7473 行）；**本地 jsonl**（`messages` + `gold_answer` 列），经 `DatasetMeta(data=rows)` 内存路径加载，完全离线 |
 | 采样参数 | temperature=1.0, top_p=0.95, logprobs=1, num_samples=1 |
 | 每步序列数 | batch4 × gen（base/tok/d200/d1000=16，gen2=8，gen8=32） |
 
@@ -67,15 +67,24 @@ reward、ground truth、首个分叉位置，用于人工核对文本差异形�
 `rewards_identical` / `advantages_identical` 是"全零"的平凡真，Level-2 的
 奖励确定性检查同理平凡。叠加第二个问题：模型输出为 `**Final Answer:** 72
 clips.` 形态，不含 `\boxed{}`/`####`，`GSM8KAccuracyReward` 本也无法提取。
-**修复（已修入脚本，待重跑验证）**：(1) `create_dataset` 对齐 server 示例，
-`map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))` ——
-system prompt 要求 `\boxed{}` 输出，ground truth 写入 `user_data`；
-(2) `_score` 增加容错提取兜底（`\boxed{}` → `####` → 末尾数字）；
-(3) 启动诊断打印行结构（keys/user_data/preview）与解析出的 gt。耗时测量
-已确认不受影响（与奖励值无关）。
+**修复（已落地并验证）**：(1) 数据集行实为 `messages` + **`gold_answer`**
+列（无 `question`/`answer`）；`_MessagesGSM8KPreprocessor` 从 `gold_answer`
+/assistant 参考消息提取答案写入 `user_data`，并从 prompt 移除参考消息；
+(2) system prompt 要求 `\boxed{}` 输出；(3) `_score` 容错提取兜底
+（`\boxed{}` → `####` → 末尾数字）；(4) 本地 jsonl 经 `DatasetMeta(data=rows)`
+内存路径加载——**完全离线，绕开 modelscope loader**。
+纯 CPU 验证脚本 `verify_dataset_reward.py` 实测通过
+（7473 行 map、GT 全部非空、对/错奖励 1.0/0.0）。
 
-**结论（修订后）**：位级不等价成立（12/16 tokens 发散、且发散均为措辞级）；
-reward/advantage 层面的"一致"在 ground truth 修复前不作数，修复后重跑验证。
+**Level-1 最终实测（数据适配 + 引擎级流式，base 档 16 对）**：
+`all_ok: true` —— tokens / logprobs（max diff 0.0）/ decoded / rewards /
+advantages 全部逐位一致。引擎级流式与整批采样在相同输入与 greedy 参数下
+**位级等价**；此前 v2 的 12/16 token 发散（提示词无 system 指令、参考消息
+混入 prompt）已随修复消失。`rewards_identical` 在真实 ground truth 下
+成立，非平凡。
+
+**结论（最终）**：Level-1 全部检查通过（位级等价达成）；reward/advantage
+层面的一致建立在真实 ground truth 之上（非平凡真）。
 
 ### 3.2 Level 2（语义：随机采样）
 
@@ -88,57 +97,61 @@ reward/advantage 层面的"一致"在 ground truth 修复前不作数，修复�
 
 **结论：Level-2 全部通过（60 个 run-路径-步骤检查点均 True）。**
 
-## 4. 收益测量结果
+## 4. 收益测量结果（v4：引擎级流式，最终数据）
 
 > 数值 = 该 run 该路径所有步骤的均值（秒）。`t_submit` 均在 0.01s 以下，省略。
+> Path B 为引擎级流式（`vLLMSampler.sample_sequences_to_queue`，一次远程调用内
+> 并发调度全部序列，事件经 Ray 队列逐条回传）。v2/v3（legacy N 调用）数据见
+> 附录 D 对照表。
 
 ### 4.1 基础配置（batch=4, gen=4, max_tokens=1024, delay=0，6 步）
 
-| 指标 | A（批量） | B（流式） | 说明 |
+| 指标 | A（批量） | B（引擎流式） | 说明 |
 |---|---|---|---|
-| t_sample | 11.87 | 95.85 | B 因 actor 串行化慢 8.1× |
-| t_collect（奖励尾部等待） | 0.00 | 0.01 | delay=0 时双方都接近 0 |
-| t_train | 3.84 | 3.94 | 基本一致 |
-| **t_total（s/步）** | **16.70** | **100.68** | **B 慢 6.0×** |
-| seq/s | 1.09 | 0.18 | A 的 6 倍 |
-| reward_head_start | 11.87 | **4.80** | ✅ 流式重叠生效：B 第一条奖励在采样开始 ~4.8s 即开始，比 A 早 ~7s |
-| reward_tail_after_sample | 0.00 | 0.01 | delay=0 均 ~0 |
+| t_sample | 19.6 | 20.3 | **B ≈ A，合批恢复**（legacy 曾为 95.9，A 的 8×） |
+| t_collect（奖励尾部等待） | 0.00 | 0.00 | delay=0 均接近 0 |
+| t_train | 3.7 | 3.6 | 基本一致 |
+| **t_total（s/步）** | **24.4** | **24.5** | **B/A = 1.00×** |
+| seq/s | 0.65 | 0.65 | 持平 |
+| reward_head_start | 19.7 | ~16 | 合批后序列几乎同时完成，重叠窗口变小（正常特征） |
+| reward_tail_after_sample | 0.00 | -0.001 | B 最后一条奖励早于采样结束就绪（负值） |
 
-### 4.2 单变量扫描（每 run 4 步）
+### 4.2 全配置扫描（engine 流式，每 run 4 步）
 
-| run | 变量 | A t_total | B t_total | B/A | 观察 |
-|---|---|---|---|---|---|
-| base | — | 16.70 | 100.68 | 6.03× | 基准 |
-| gen2 | gen=2（8 序列） | 13.95 | 49.94 | 3.58× | 序列越少，串行化代价越小 |
-| gen8 | gen=8（32 序列） | 29.40 | 208.14 | **7.08×** | 序列越多，串行化代价越大（∝N） |
-| tok512 | max_tokens=512 | 16.19 | 92.88 | 5.74× | 长度缩短无帮助 |
-| tok2048 | max_tokens=2048 | 18.83 | 105.70 | 5.61× | 长度加长无帮助（收益 ~秒级，被串行化吞没） |
-| d200 | delay=200ms | A t_collect=0.21，B t_collect=1.35 | 19.81 | 106.74 | 5.39× | 延迟使 B 的奖励等待更差 |
-| d1000 | delay=1000ms | A t_collect=1.01，B t_collect=8.01 | 19.68 | 108.14 | 5.49× | B 的逐序列 handle 受 2 线程池限制，奖励吞吐 1/8 |
+| run | 变量 | A t_total | B t_total | B/A |
+|---|---|---|---|---|
+| base | — | 24.4 | 24.5 | **1.00×** |
+| gen2 | gen=2 | 21.2 | 21.2 | 1.00× |
+| gen8 | gen=8 | 32.7 | 33.0 | 1.01× |
+| tok512 | max_tokens=512 | 17.4 | 18.2 | 1.05× |
+| tok2048 | max_tokens=2048 | 44.6 | 44.1 | 0.99× |
+| d200 | delay=200ms | A t_collect=0.21，B t_collect≈0.4~1.6 | 25.5 | 26.9 | 1.05× |
+| d1000 | delay=1000ms | A t_collect=1.005，B t_collect≈1.7~7.9 | 26.3 | 31.5 | 1.20× |
 
-**重叠指标的细节**（B 的 head_start 均远小于其 t_sample）：
-- base/B head=4.80s vs t_sample=95.85s；gen8/B head=4.61s vs 194.73s；
-  d1000/B head=4.77s vs 92.74s ——「边采样边算奖」机制确认生效，但奖励窗口
-  （~几秒）相对串行化采样的损失（数十~上百秒）可忽略。
+**扫描结论**：除 d1000（奖励昂贵场景）外，B/A 全部落在 0.99~1.05×——引擎级流式
+在采样层面与整批持平，且保留逐条事件语义。d1000 的残余代价来自奖励提交粒度
+（16 个单 item handle 受 pipeline 2 线程池限制，collect 1.7~7.9s vs A 的 1.0s），
+是分块粒度问题而非采样问题（见 §5 结论 4）。
 
 ## 5. 结论
 
-1. **正确性**：Level-2（结构/对齐/奖励确定性）全部通过；Level-1 位级等价不成立
-   （12/16 tokens 发散，机制见 3.1），但 reward/advantage 层面一致 —— 训练
-   不等价，报告中按「近似一致」记录。
-2. **流式重叠机制有效**（v2 修复后）：B 的第一条奖励在采样开始后 ~4-5s 即开始
-   计算，比整批提交早 ~7-12s；delay=0 时奖励等待几乎为 0。
-3. **但本地 ray 模式下「逐序列远程调用」式流式不可行**：同一 sampler actor
-   串行执行 N 个远程调用（`max_concurrency=1`），采样耗时 ≈ N × 单序列耗时
-   （实测 8/16/32 序列时总耗时放大 3.6×/6.0×/7.1×），任何奖励重叠收益都被
-   吞没。**结论：与 server 模式不同，本地 ray 模式没有引擎级逐序列事件流
-   （`stream_sample_to_data_plane`），无法用纯客户端手段做出有收益的流式采样。**
-4. **奖励昂贵场景（d1000）也不反转结论**：A 的 naive manager 对 chunk 内并行
-   打分（1s×16 items 在 1.0s 内完成），B 的 16 个单 item handle 受
-   pipeline 2 线程池限制串行成 8.0s —— 逐序列提交在奖励层反而是劣势。
-5. **实践建议**：本地 ray 模式下用「整批采样 + 奖励管线双缓冲」；真正的流式
-   收益（奖励与采样重叠）需要 vLLM 引擎层提供逐序列完成事件（推广
-   `stream_sample_to_data_plane` 到本地组件），或作为服务端部署使用。
+1. **正确性**：Level-2（结构/对齐/奖励确定性）全部通过；**Level-1 在数据适配修复 +
+   引擎级流式下首次整体通过**（tokens/logprobs/decoded/rewards/advantages 全部一致，
+   `semantic_ok=True`）。此前 v2 的 12/16 token 发散源于提示词无 system 指令 +
+   参考消息混入 prompt + 批形状数值差异，修复提示词后消失。
+2. **引擎级流式合批恢复（本次核心成果）**：`vLLMSampler.sample_sequences_to_queue`
+   一次远程调用内并发调度全部序列，vLLM 保持合批——B 的 t_sample 回到 A 的水平
+   （base 20.3s vs 19.6s），**t_total B/A = 0.99~1.05×（除 d1000）**，与此前
+   legacy N 调用实现的 3.6~7.1× 形成对照。逐条事件语义保留（Level-1 对齐验证通过）。
+3. **流式重叠窗口随合批自然消失**：序列几乎同时完成时，「首条奖励早于采样结束」
+   的窗口变小（head_start ≈ t_sample），tail 出现负值（奖励先于采样结束就绪）——
+   这是引擎级流式的正常特征，整体耗时反而最优。
+4. **残余代价：奖励提交粒度（分块）**：d1000 下 B 的 t_collect（1.7~7.9s）> A
+   （1.0s），因逐序列提交产生 16 个单 item handle，受 pipeline 线程池（=num_workers=2）
+   限制。与采样方式无关；若奖励昂贵且打分本身可并行，改为整批提交（大 chunk）可消除。
+5. **实践建议**：本地 ray 模式下使用引擎级流式（`sample_sequences_to_queue`）即可在
+   保留逐条事件语义的同时获得整批采样性能；奖励端按成本选择提交粒度
+   （便宜奖励整批提交；昂贵且可并行的奖励逐条或小批量提交）。
 
 ## 6. 脚本已修复的问题
 
@@ -152,7 +165,98 @@ reward/advantage 层面的"一致"在 ground truth 修复前不作数，修复�
 4. **Path B 奖励提交时机缺陷（v1）**：提交在采样循环结束后才执行，
    `reward_head_start ≈ t_sample`，重叠未发生 —— v2 已改为每条序列完成即提交，
    实测重叠生效（见 4.1）。
+5. **ground truth 契约缺口**：原始行无 `answer`/`ground_truth`，奖励恒 0——
+   已对齐 `GSM8KProcessor` 映射 + 容错答案提取（v3，待重跑验证非平凡结果）。
+
+## 7. v3：本地引擎级逐序列流式（消除 B 的串行化代价）
+
+**背景**：v2 的 Path B 用 N 次并发远程调用模拟流式，被 sampler actor 串行执行，
+采样耗时 ≈ N × 单序列时间（8/16/32 序列时 3.6×/6.0×/7.1×）。结论是"本地模式
+需要引擎级逐序列事件流"。
+
+**实现（v3）**：库层新增 `vLLMSampler.sample_sequences_to_queue`
+（`src/twinkle/sampler/vllm_sampler/vllm_sampler.py`）——一次远程调用
+（`dispatch='all', execute='first'`）内，actor 事件循环并发调度全部序列
+（与 `sample()` 相同的 gather 形态，vLLM 保持合批），完成一个即向 Ray 队列推
+`(index, SampleResponse)` 事件，全部完成后推哨兵。bench 的 Path B 改用该接口：
+driver 线程池持调用、主线程按完成顺序收事件 → 逐条提交奖励。
+
+**预期效果**（待实测）：
+- t_sample 恢复到整批水平（≈ Path A），B/A 收益比回归 1.0 附近；
+- 保留逐序列完成即提交的重叠（`reward_head_start` 远小于 t_sample）；
+- 备选回退：`BENCH_PATH_B_STREAM=legacy` 可回到 v2 的 N 调用实现用于对照。
+
+**验证方法**：`BENCH_RUNS=base python bench_streaming_local.py`，
+比较新 CSV 中 base 的 `t_sample`（B ≈ A）与 `reward_head_start`（B 仍远小于 t_sample）。
 
 ---
 
-*报告由 `bench_streaming_local.py` v2 运行产物（`results/bench_summary.csv`，61 行）汇总生成。*
+*报告由 `bench_streaming_local.py` v4（引擎级流式）运行产物汇总生成。*
+
+## 8. RM（奖励模型）场景实测
+
+> 配置：生成式 judge（`TWINKLE_REWARD_MODEL_ID`，独立 GPU，max_tokens=8 判词输出）；
+> batch=2×gen=2（每步 4 条）、max_tokens=512、3 步；提交流粒度三档。
+> 方案：`docs/designs/rm_bench_plan.md`。
+
+### 结果（稳定步均值；首步含 judge 引擎 warm-up 一次性开销 46s，已剔除）
+
+| run | 路径 | 粒度 | t_sample | t_collect | t_total |
+|---|---|---|---|---|---|
+| rm-whole | A | 整批（1 handle） | 8.5s | 0.96s | 11.3s |
+| rm-b-whole | B | 整批 | 9.2s | 0.97s | 11.6s |
+| rm-b-mini | B | 每 2 条一批 | 9.2s | 1.30s | 12.0s |
+| rm-b-per | B | 逐条 | 9.3s | 1.27s | 11.9s |
+
+### 结论（RM 场景）
+
+1. **提交粒度差异从"数量级"缩至"噪声级"**：真实 judge 每条延迟仅 ~0.3s（8 token 判词），
+   2 线程并行已吸收大部分串行代价——collect 差异 ~30%、t_total 差异 ~6%
+   （与 d1000 模拟的 8 倍放大形成对照：模拟 sleep 每条 1s，串行代价被放大）。
+   whole 仍略优（judge 合批 + 无 handle 开销），但三者实际可视为等价。
+2. **采样路径（A vs B）在 RM 场景同样持平**（11.3 vs 11.6s，t_sample 8.5 vs 9.2s）。
+3. **⚠️ judge 判别质量限制**：`reward_mean=0.0000` 且无解析失败告警——judge 全部判
+   Incorrect（4B 验证器判别失效）。**延迟特征（真实推理耗时）有效，判别语义无效**；
+   性能对比结论不受影响；如需真实判别需换更强 judge 或判别式 RM 权重。
+4. 对实践的意义：在"奖励昂贵但单条延迟不高（秒级内）"场景，提交粒度几乎不影响
+   总耗时；只有单条奖励延迟很大（数秒+）且打分并行受限时，整批/小批提交才有
+   可测量的优势（d1000 模拟的边界情形）。
+
+### 8.1 边界验证：长尾生成 + 昂贵 judge（采样 2048 / judge 200 token 判词）
+
+> 目的：验证"奖励成为关键路径"时，流式与提交粒度的表现（`bench_streaming_local.py`，
+> 环境变量 `BENCH_RM_MAX_TOKENS=2048`、`TWINKLE_REWARD_JUDGE_MAX_TOKENS=200`）。
+
+| run | t_sample | t_collect | t_total（含 step0 抖动） |
+|---|---|---|---|
+| rm-whole / A | 27.8s | 12.1s | 46.7s（剔除 step0 后 ~41.5s） |
+| rm-b-whole / B | 25.1s | 11.96s | 39.0s（剔除 step0 后 ~40.8s） |
+| rm-b-mini / B | 25.2s | 17.4s | 44.3s |
+| rm-b-per / B | 24.9s | 15.1s | 41.7s |
+
+**边界结论**：
+1. **奖励成为关键路径的幅度不足**：judge 合批 collect 12s，仍低于采样 25-28s——流式（B）
+   与批量（A）持平（t_total 差 ~1s，噪声级），**流式未因奖励变贵而反超**；
+2. **提交粒度首次显著分化**：整批提交（collect 11.96s）比小批（17.4s，-31%）与逐条
+   （15.1s，-21%）更优——长判词下 judge 推理合批收益真实显现
+   （4 条共享 prefill/decode，与 d1000 sleep 模拟的线程等待机制不同）；
+3. **RM 模式下 `semantic_ok` 列不可用**（`reward_deterministic` 检查将 judge 分数与规则
+   奖励比对，语义不再成立），应忽略；`reward_head_start/tail` 同理为空（batch_judge
+   manager 未打奖励时间线点，如需可补）。
+## 附录 D：legacy（N 次远程调用）与 engine（引擎级流式）对照
+
+| run | legacy A t_total | legacy B t_total | legacy B/A | engine A t_total | engine B t_total | engine B/A |
+|---|---|---|---|---|---|---|
+| base | 16.70 | 100.68 | 6.03× | 24.4 | 24.5 | 1.00× |
+| gen2 | 13.95 | 49.94 | 3.58× | 21.2 | 21.2 | 1.00× |
+| gen8 | 29.40 | 208.14 | 7.08× | 32.7 | 33.0 | 1.01× |
+| tok512 | 16.19 | 92.88 | 5.74× | 17.4 | 18.2 | 1.05× |
+| tok2048 | 18.83 | 105.70 | 5.61× | 44.6 | 44.1 | 0.99× |
+| d200 | 19.81 | 106.74 | 5.39× | 25.5 | 26.9 | 1.05× |
+| d1000 | 19.68 | 108.14 | 5.49× | 26.3 | 31.5 | 1.20× |
+
+> legacy 数据为 v2 实测；engine 数据为 v4 实测。
+> 核心对照：legacy B 因 actor 串行化放大 3.6~7.1×；engine B 与 A 持平
+> （0.99~1.05×，d1000 除外）。A 侧绝对值的差异源于提示词变更
+> （system 指令 + 参考消息移除）与运行环境波动，不影响 B/A 比值结论。
+

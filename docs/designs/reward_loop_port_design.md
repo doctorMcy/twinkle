@@ -348,7 +348,7 @@ submit 当前批 → collect + 训练上一批 → flush 尾批。适配器（`g
 | P1 核心流水线 | data.py / reward_manager 家族 / default_score / worker / pipeline / 单测 | ✅ 完成（`src/twinkle/reward_loop/` 全部文件；`limited.py` AsyncTokenBucket、`dapo.py` overlong、`gdpo.py` experiment_name 已移植） |
 | P2 集成 | cookbook 接入 / 本机 e2e / 指标 | ✅ 完成（4 个示例 + 基准脚本；基准即 e2e 验证，见 §9） |
 | P3 增强 | 异步自定义函数示例 / README 组件文档 / sync 回退回归 | 🟡 部分：sync 回退 ✅；README/组件文档待补 |
-| P4 未来扩展 | DisRM/GenRM 服务 / 逐样本 true streaming / token 级 rm_scores | ⏳ 未启动；基准已产出关键前置结论（R6） |
+| P4 未来扩展 | DisRM/GenRM 服务 / 逐样本 true streaming / token 级 rm_scores | 🟡 部分启动：本地引擎级逐序列流式已实现（`vLLMSampler.sample_sequences_to_queue`，基准 v3），待实测；DisRM/GenRM 服务与 token 级组装仍未启动 |
 
 ---
 
@@ -396,7 +396,7 @@ submit 当前批 → collect + 训练上一批 → flush 尾批。适配器（`g
 | R3 | `data_source` 分派依赖命名 | 默认打分能力受限 | 🟡 `default_score.py` 注册表存在但**无内置注册项**；示例一律显式传 `compute_score`；建议后续注册 gsm8k/math 等默认打分手 |
 | R4 | verl padding 语义简化 | 切块行为 | ✅ 纯 list 切分等价，无跨 batch padding 损耗 |
 | R5 | YAML 内联 dict 与扁平键 | 配置体验 | 🟡 字段已落地；建议 P3 校准文档 |
-| R6 | 逐样本真流式需 sampler 改造 | 重叠粒度 | ✅ **已实测**：batch 级双缓冲达成重叠（G2）；本地模式 N×并发远程调用被 actor 串行化（端到端慢 3.6×~7.1×，基准 §5.3）——真流式只能走 server 版 `stream_sample_to_data_plane`（示例已给）或本地引擎级逐序列事件流（库层改造，P4） |
+| R6 | 逐样本真流式需 sampler 改造 | 重叠粒度 | ✅ **已实测 + 已提供本地引擎级实现**：batch 级双缓冲达成重叠（G2）；N×并发远程调用被 actor 串行化（端到端慢 3.6×~7.1×，基准 §5.3）；本地引擎级实现 `vLLMSampler.sample_sequences_to_queue`（一次调用内并发 + Ray 队列逐条回传事件，`dispatch='all', execute='first'`）已落地，待实测验证合批恢复（基准 v3） |
 | R7 | 分块粒度经济性 | 逐样本提交吞吐 | ✅ **已实测**：1-item chunk × num_workers 线程池时奖励吞吐差 ~8×（d1000）；提交粒度应按奖励成本选择（§5.5） |
 | R8 | 奖励提取格式（\boxed/####） | 无 system 指令时恒 0 | ✅ 示例层已修（system prompt + 容错提取）；库内 `GSM8KAccuracyReward` 保持原语义 |
 | R9 | 双缓冲掩盖流式收益 | 基准测量失真 | ✅ 已确认：测量流式收益使用单缓冲调度（基准脚本设计），报告 §5.2 |

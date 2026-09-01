@@ -25,6 +25,7 @@ BENCH_OUT_DIR.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import itertools
 import json
@@ -47,9 +48,11 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.metric import CompletionRewardMetric
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
-from twinkle.preprocessor.llm import GSM8KProcessor
+from twinkle.preprocessor.base import Preprocessor
 from twinkle.reward import GSM8KAccuracyReward
-from twinkle.reward_loop import AsyncRewardPipeline, RewardItem
+from twinkle.reward_loop import (AsyncRewardPipeline, RewardItem, RewardResult,
+                                 register)
+from twinkle.reward_loop.reward_manager import RewardManagerBase
 from twinkle.sampler import vLLMSampler
 
 logger = get_logger()
@@ -59,6 +62,8 @@ logger = get_logger()
 # ---------------------------------------------------------------------------
 MODEL_ID = os.environ.get('TWINKLE_MODEL_ID', 'ms://Qwen/Qwen3.5-4B')
 DATASET_ID = os.environ.get('TWINKLE_DATASET_ID', 'ms://modelscope/gsm8k')
+# 奖励模型（judge）可独立于训练模型配置；默认跟随训练模型。
+REWARD_MODEL_ID = os.environ.get('TWINKLE_REWARD_MODEL_ID', MODEL_ID)
 # Qwen3.5/3.6 are multimodal (vision tower); other models use the plain chat
 # template. Override explicitly with TWINKLE_TEMPLATE_CLS when needed.
 _IS_MULTIMODAL_QWEN = 'Qwen3.5' in MODEL_ID or 'Qwen3.6' in MODEL_ID
@@ -66,10 +71,17 @@ TEMPLATE_CLS = os.environ.get(
     'TWINKLE_TEMPLATE_CLS',
     'Qwen3_5Template' if _IS_MULTIMODAL_QWEN else 'Template',
 )
+_IS_MULTIMODAL_REWARD = 'Qwen3.5' in REWARD_MODEL_ID or 'Qwen3.6' in REWARD_MODEL_ID
+REWARD_TEMPLATE_CLS = os.environ.get(
+    'TWINKLE_REWARD_TEMPLATE_CLS',
+    'Qwen3_5Template' if _IS_MULTIMODAL_REWARD else 'Template',
+)
 
 MODEL_GPUS = int(os.environ.get('TWINKLE_MODEL_GPUS', '1'))
 SAMPLER_GPUS = int(os.environ.get('TWINKLE_SAMPLER_GPUS', '1'))
-NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS
+REWARD_GPUS = int(os.environ.get('TWINKLE_REWARD_GPUS', '1'))
+BENCH_RM = os.environ.get('BENCH_RM', '0') == '1'
+NUM_GPUS = MODEL_GPUS + SAMPLER_GPUS + (REWARD_GPUS if BENCH_RM else 0)
 
 LEARNING_RATE = float(os.environ.get('TWINKLE_LEARNING_RATE', '1e-5'))
 ADAPTER_NAME = os.environ.get('TWINKLE_ADAPTER_NAME', 'bench-streaming-grpo')
@@ -83,6 +95,14 @@ TIMELINE_PATH = os.path.join(BENCH_OUT_DIR, 'bench_timeline.jsonl')
 SUMMARY_PATH = os.path.join(BENCH_OUT_DIR, 'bench_summary.csv')
 LEVEL1_TEXTS_PATH = os.path.join(BENCH_OUT_DIR, 'level1_texts.json')
 BENCH_RUNS = os.environ.get('BENCH_RUNS', 'all')
+# 'engine' = one remote call (vLLMSampler.sample_sequences_to_queue): all
+# sequences scheduled concurrently in the sampler actor (vLLM keeps batching),
+# completion events stream back through a Ray queue.
+# 'legacy' = N concurrent per-input remote calls (serialized by the actor).
+BENCH_PATH_B_STREAM = os.environ.get('BENCH_PATH_B_STREAM', 'engine')
+# RM 模式：奖励提交粒度（whole=整批 / mini=每 K 条一批 / per-item=逐条）。
+BENCH_SUBMIT_GRANULARITY = os.environ.get('BENCH_SUBMIT_GRANULARITY', 'per-item')
+MINI_SUBMIT_SIZE = int(os.environ.get('BENCH_MINI_BATCH_SIZE', '2'))
 
 BASE_STEPS = 6
 SWEEP_STEPS = 4
@@ -107,6 +127,15 @@ def build_runs() -> List[Dict[str, Any]]:
         dict(name='d200', batch=4, gen=4, max_tokens=1024, delay_ms=200, steps=SWEEP_STEPS),
         dict(name='d1000', batch=4, gen=4, max_tokens=1024, delay_ms=1000, steps=SWEEP_STEPS),
     ]
+    if BENCH_RM:
+        # RM 场景专用矩阵：路径 × 提交粒度（小规模，每步 4 条序列）。
+        base = dict(batch=2, gen=2, max_tokens=BENCH_RM_MAX_TOKENS, delay_ms=0, steps=3)
+        return [
+            dict(name='rm-whole', path='A', granularity='whole', **base),
+            dict(name='rm-b-whole', path='B', granularity='whole', **base),
+            dict(name='rm-b-mini', path='B', granularity='mini', **base),
+            dict(name='rm-b-per', path='B', granularity='per-item', **base),
+        ]
     if BENCH_RUNS == 'smoke':
         return [dict(name='smoke', batch=1, gen=2, max_tokens=64, delay_ms=0, steps=1)]
     if BENCH_RUNS == 'all':
@@ -184,19 +213,56 @@ def get_reward_delay() -> float:
 # Dataset + reward scoring (same contract as minimal_grpo_local.py)
 # ---------------------------------------------------------------------------
 def create_dataset() -> Dataset:
-    """GSM8K dataset with the same mapping as the server-side examples.
+    """GSM8K dataset adapted from its message-format rows.
 
-    ``GSM8KProcessor`` builds system+user messages (system prompt demands a
-    ``\\boxed{}`` final answer) and stores the extracted ground truth in
-    ``user_data`` — without it, raw rows carry no ground truth and every
-    reward is 0. Rows stay trajectories (not ``encode()``-d), so the sampler
-    encodes them on the fly and ``messages``/``user_data`` remain available
-    to reward adapters.
+    Local jsonl files (``TWINKLE_DATASET_ID`` pointing at a file) are loaded
+    through the in-memory path (``DatasetMeta(data=rows)``) so loading never
+    touches the modelscope hub loader — guarantees offline operation even on
+    hosts where modelscope's loader is unavailable or network-restricted.
+
+    Otherwise (``ms://...``) rows come from the hub and are already
+    ``messages`` (user question + assistant reference solution ending with
+    ``#### <n>``). ``_MessagesGSM8KPreprocessor`` extracts the ground truth
+    into ``user_data``, drops the reference message so it never leaks into
+    the sampled prompt, and prepends the ``\\boxed{}`` system prompt. Rows
+    stay trajectories (not ``encode()``-d).
     """
     dataset = Dataset(DatasetMeta(DATASET_ID, subset_name='main', split='train'))
-    dataset.map(GSM8KProcessor(system='Put the final answer within \\boxed{}.'))
+    dataset.map(_MessagesGSM8KPreprocessor(system='Put the final answer within \\boxed{}.'))
     dataset.set_template(TEMPLATE_CLS, model_id=MODEL_ID, max_length=400)
     return dataset
+
+
+class _MessagesGSM8KPreprocessor(Preprocessor):
+    """Adapt message-format GSM8K rows to (messages, user_data) trajectories."""
+
+    def __init__(self, system: str = None):
+        self.system = system
+
+    def __call__(self, rows: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+        rows = self.map_col_to_row(rows)
+        rows = [self.preprocess(row) for row in rows]
+        return self.map_row_to_col(rows)
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        messages = list(row.get('messages') or [])
+        ground_truth = ''
+        kept = []
+        for msg in messages:
+            if msg.get('role') == 'assistant':
+                # Reference solution embedded in messages; use for GT, drop
+                # from the prompt so it never leaks into sampling.
+                if not ground_truth:
+                    ground_truth = _extract_ground_truth_from_answer(msg.get('content', ''))
+            else:
+                kept.append(msg)
+        if not ground_truth:
+            # modelscope rows carry the reference solution in a separate
+            # 'gold_answer' column instead of an assistant message.
+            ground_truth = _extract_ground_truth_from_answer(row.get('gold_answer', ''))
+        if self.system:
+            kept = [{'role': 'system', 'content': self.system}] + kept
+        return {'messages': kept, 'user_data': [('ground_truth', ground_truth)]}
 
 
 def _extract_predicted_answer(completion: str) -> str:
@@ -253,6 +319,89 @@ def gsm8k_score(data_source: str, solution_str: str, ground_truth: str, extra_in
     score, meta = _score(data_source, solution_str, ground_truth, extra_info)
     TIMELINE.record('__run__', '__path__', 'reward_end', item_id=item_id)
     return score, meta
+
+
+# ---------------------------------------------------------------------------
+# RM（奖励模型）模式：生成式 judge 打分（独立 GPU 批级调用）
+# ---------------------------------------------------------------------------
+# 边界验证（长尾生成 + 昂贵 judge）：扩大判词长度让 judge 先推理再判定，
+# 单条延迟升至秒级；RM 采样 max_tokens 由 BENCH_RM_MAX_TOKENS 控制。
+_JUDGE_MAX_TOKENS = int(os.environ.get('TWINKLE_REWARD_JUDGE_MAX_TOKENS', '8'))
+BENCH_RM_MAX_TOKENS = int(os.environ.get('BENCH_RM_MAX_TOKENS', '512'))
+_JUDGE_SYSTEM = ('You are a strict math answer verifier. Reason briefly about '
+                 'whether the model answer matches the ground truth, then end '
+                 'your response with exactly one word on the last line: Correct '
+                 'or Incorrect.')
+_JUDGE_PARAMS = SamplingParams(max_tokens=_JUDGE_MAX_TOKENS, num_samples=1,
+                               temperature=0.0)
+
+
+_JUDGE_MAX_SOLUTION_CHARS = 3000
+
+
+def judge_prompt_for(item: RewardItem) -> Dict[str, Any]:
+    """Verification trajectory (dict with ``messages``): question + model
+    answer + ground truth — the shape ``sampler.sample`` expects.
+
+    Long model answers are truncated to their tail (the final answer region),
+    so judge prompts stay within the judge engine's context window.
+    """
+    prompt = item.extra_info.get('prompt') if isinstance(item.extra_info, dict) else {}
+    question = ''
+    for msg in reversed(list((prompt or {}).get('messages') or [])):
+        if msg.get('role') == 'user':
+            question = msg.get('content', '')
+            break
+    solution = item.solution_str or ''
+    if len(solution) > _JUDGE_MAX_SOLUTION_CHARS:
+        solution = '...[truncated, showing tail]...\n' + solution[-_JUDGE_MAX_SOLUTION_CHARS:]
+    return {'messages': [
+        {'role': 'system', 'content': _JUDGE_SYSTEM},
+        {'role': 'user', 'content':
+            f'Question: {question}\n\nModel answer: {solution}\n\n'
+            f'Ground truth: {item.ground_truth}\n\nIs the model answer correct?'},
+    ]}
+
+
+def parse_judge_verdict(text: str) -> Optional[float]:
+    if re.search(r'\bcorrect\b', text, re.IGNORECASE):
+        return 1.0
+    if re.search(r'\bincorrect\b', text, re.IGNORECASE):
+        return 0.0
+    return None
+
+
+@register('batch_judge')
+class BatchJudgeRewardManager(RewardManagerBase):
+    """Reward manager that scores a whole chunk with one judge engine call.
+
+    Items in a chunk are packed into one ``judge_sampler.sample(prompts)``
+    call so the judge's vLLM batches them (real RM batching), then each
+    verdict is parsed per item. Chunk size = reward submission granularity
+    (whole / mini / per-item), so the granularity experiment controls exactly
+    how many trajectories the judge sees per engine call.
+    """
+
+    def __init__(self, compute_score=None, judge_sampler=None, **kwargs):
+        super().__init__(compute_score=compute_score, **kwargs)
+        self.judge_sampler = judge_sampler
+
+    async def run_batch(self, items):
+        if not items:
+            return []
+        prompts = [judge_prompt_for(item) for item in items]
+        responses = await asyncio.to_thread(
+            self.judge_sampler.sample, prompts, _JUDGE_PARAMS, '')
+        results = []
+        for item, response in zip(items, responses):
+            text = response.sequences[0].decoded or ''
+            score = parse_judge_verdict(text)
+            if score is None:
+                score = 0.0
+                logger.warning(f'[judge] unparsed verdict {text[:80]!r} for {item.item_id}')
+            results.append(RewardResult(
+                item.item_id, score, {'judge_verdict': text.strip()[:60]}))
+        return results
 
 
 _ANS_RE = re.compile(r'####\s*(-?\d+(?:[.,]\d+)?)')
@@ -334,16 +483,58 @@ def sample_batch(sampler, prompts: List[Dict[str, Any]], params: SamplingParams,
 
 def sample_stream(sampler, prompts: List[Dict[str, Any]], params: SamplingParams,
                   num_generations: int):
-    """Path B: N concurrent per-input calls; yields (index, SampledSequence)
-    as each sequence finishes (order-independent)."""
+    """Path B: per-sequence completion events with engine-level concurrency.
+
+    'engine' (default): one remote call
+    (``vLLMSampler.sample_sequences_to_queue``) schedules ALL sequences in the
+    sampler actor's event loop — vLLM keeps batching the whole batch, so
+    t_sample stays at the batch level — and streams ``(index, SampleResponse)``
+    events back through a Ray queue in completion order (local-mode counterpart
+    of the server's ``stream_sample_to_data_plane``).
+
+    'legacy': N concurrent per-input remote calls, serialized by the actor
+    (~N x single-sequence time; kept for comparison).
+    """
     expanded = _expand(prompts, num_generations)
-    with ThreadPoolExecutor(max_workers=len(expanded)) as pool:
-        futures = {pool.submit(sampler.sample, [traj], params, ADAPTER_NAME): idx
-                   for idx, traj in enumerate(expanded)}
-        for future in as_completed(futures):
-            idx = futures[future]
-            response = future.result()[0]
-            yield idx, response.sequences[0]
+    if BENCH_PATH_B_STREAM == 'legacy':
+        with ThreadPoolExecutor(max_workers=len(expanded)) as pool:
+            futures = {pool.submit(sampler.sample, [traj], params, ADAPTER_NAME): idx
+                       for idx, traj in enumerate(expanded)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                response = future.result()[0]
+                yield idx, response.sequences[0]
+        return
+    if BENCH_PATH_B_STREAM != 'engine':
+        raise ValueError(f"BENCH_PATH_B_STREAM must be 'engine' or 'legacy', got {BENCH_PATH_B_STREAM!r}")
+
+    import queue as stdlib_queue
+    import ray
+    from ray.util.queue import Queue
+    queue = Queue()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        remote = pool.submit(
+            sampler.sample_sequences_to_queue, queue, expanded, params, ADAPTER_NAME)
+        try:
+            expected = len(expanded)
+            received = 0
+            while True:
+                try:
+                    idx, response = queue.get(timeout=1.0)
+                except stdlib_queue.Empty:
+                    if remote.done():
+                        # Engine side finished (or failed) without a sentinel.
+                        remote.result()  # re-raises engine-side errors
+                        raise RuntimeError(
+                            f'stream ended early: {received}/{expected} events, no sentinel')
+                    continue
+                if idx is None:
+                    break
+                received += 1
+                yield idx, response.sequences[0]
+        finally:
+            # Drain complete; propagate any engine-side error.
+            remote.result()
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +710,9 @@ def run_path(run_cfg: Dict[str, Any], path: str, sampler, pipeline, model,
     """Run one path over the given batches; returns per-step summary rows."""
     run = run_cfg['name']
     num_generations = run_cfg['gen']
+    # 提交粒度：RM 模式由 run 矩阵决定；普通模式 B 保持逐条（流式语义）。
+    granularity = run_cfg.get('granularity') or (
+        'per-item' if path == 'B' else 'whole')
     params = SamplingParams(max_tokens=run_cfg['max_tokens'], num_samples=1,
                             logprobs=1, temperature=1.0, top_p=0.95)
     rows: List[Dict[str, Any]] = []
@@ -537,11 +731,24 @@ def run_path(run_cfg: Dict[str, Any], path: str, sampler, pipeline, model,
             TIMELINE.record(run, path, 'sample_end', step=step, value=t_sample)
             seqs = [(i, s) for i, s in enumerate(sequences)]
         else:
-            # Streaming: submit each sequence's reward the moment it completes,
-            # so reward computation overlaps with the still-running sequences.
+            # Streaming: submit rewards as sequences complete; the submission
+            # granularity controls how many rewards ride in one handle
+            # (per-item = immediate, mini = every K, whole = after sampling).
             t0 = time.perf_counter()
             TIMELINE.record(run, path, 'sample_start', step=step)
             seqs, items, handles = [], [], []
+            pending: List[RewardItem] = []
+            submit_threshold = 1 if granularity == 'per-item' else (
+                MINI_SUBMIT_SIZE if granularity == 'mini' else len(prompts) * num_generations)
+
+            def _flush_pending():
+                if not pending:
+                    return
+                if len(pending) < submit_threshold:
+                    return
+                _items, pending[:] = pending[:], []
+                handles.append(pipeline.submit(_items))
+
             t_submit = 0.0
             for idx, sequence in sample_stream(sampler, prompts, params, num_generations):
                 TIMELINE.record(run, path, 'sample_done', step=step, idx=idx)
@@ -549,11 +756,12 @@ def run_path(run_cfg: Dict[str, Any], path: str, sampler, pipeline, model,
                 item = make_reward_items(run, path, prompts, [(idx, sequence)],
                                          step, num_generations)[0]
                 items.append(item)
+                pending.append(item)
                 t1 = time.perf_counter()
-                TIMELINE.record(run, path, 'submit_start', step=step, idx=idx)
-                handles.append(pipeline.submit([item]))
+                _flush_pending()
                 t_submit += time.perf_counter() - t1
-                TIMELINE.record(run, path, 'submit_end', step=step, idx=idx)
+            if pending:
+                handles.append(pipeline.submit(pending))
             t_sample = time.perf_counter() - t0
             TIMELINE.record(run, path, 'sample_end', step=step, value=t_sample)
 
@@ -618,10 +826,16 @@ def main() -> None:
     runs = build_runs()
     os.makedirs(BENCH_OUT_DIR, exist_ok=True)
 
+    _sampler_start = MODEL_GPUS
+    _reward_start = MODEL_GPUS + SAMPLER_GPUS
     device_groups = [
         DeviceGroup(name='model', ranks=list(range(MODEL_GPUS)), device_type='GPU'),
-        DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)), device_type='GPU'),
+        DeviceGroup(name='sampler', ranks=list(range(_sampler_start, _reward_start)),
+                    device_type='GPU'),
     ]
+    if BENCH_RM:
+        device_groups.append(DeviceGroup(
+            name='reward', ranks=list(range(_reward_start, NUM_GPUS)), device_type='GPU'))
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     sampler_mesh = DeviceMesh.from_sizes(world_size=SAMPLER_GPUS, dp_size=SAMPLER_GPUS)
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups,
@@ -656,53 +870,87 @@ def main() -> None:
     )
     sampler.set_template(TEMPLATE_CLS, model_id=MODEL_ID)
 
+    judge_sampler = None
+    if BENCH_RM:
+        # 独立 GPU 上的 judge 引擎（冻结权重，不参与训练更新）。
+        reward_mesh = DeviceMesh.from_sizes(world_size=REWARD_GPUS, dp_size=REWARD_GPUS)
+        judge_sampler = vLLMSampler(
+            model_id=REWARD_MODEL_ID,
+            engine_args={
+                'gpu_memory_utilization': 0.8,
+                'max_model_len': 8192,
+            },
+            device_mesh=reward_mesh,
+            remote_group='reward',
+        )
+        judge_sampler.set_template(REWARD_TEMPLATE_CLS, model_id=REWARD_MODEL_ID)
+
     ckpt_manager = CheckpointEngineManager(model=model, sampler=sampler)
     advantage_fn = GRPOAdvantage()
     metrics = CompletionRewardMetric()
-    pipeline = AsyncRewardPipeline(
-        num_workers=REWARD_NUM_WORKERS,
-        mode='async',
-        backlog=REWARD_BACKLOG,
-        worker_kwargs={'compute_score': gsm8k_score},
-    )
+    if BENCH_RM:
+        pipeline = AsyncRewardPipeline(
+            num_workers=REWARD_NUM_WORKERS,
+            mode='async',
+            backlog=REWARD_BACKLOG,
+            worker_kwargs={
+                'compute_score': gsm8k_score,
+                'manager_name': 'batch_judge',
+                'reward_kwargs': {'judge_sampler': judge_sampler},
+            },
+        )
+    else:
+        pipeline = AsyncRewardPipeline(
+            num_workers=REWARD_NUM_WORKERS,
+            mode='async',
+            backlog=REWARD_BACKLOG,
+            worker_kwargs={'compute_score': gsm8k_score},
+        )
 
     def sync_weights():
         ckpt_manager.sync_weights(merge_and_sync=False)
 
     logger.info(get_device_placement())
+    if BENCH_RM:
+        logger.info(f'[bench] ** RM MODE ENABLED ** judge={REWARD_MODEL_ID} '
+                    f'reward_gpus={REWARD_GPUS} granularity-matrix='
+                    f'{BENCH_SUBMIT_GRANULARITY}')
+    else:
+        logger.info(f'[bench] RM mode disabled (add BENCH_RM=1 for reward-model runs)')
     logger.info(f'[bench] outputs -> {BENCH_OUT_DIR}')
     summary_rows: List[Dict[str, Any]] = []
     try:
-        first = runs[0]
-        base_batch = max(1, first['batch'])
-        # Level-1 determinism check on one batch, before any training.
-        # instance_id keeps Ray actor names unique: remote_class derives the
-        # actor name from the caller's source line, so two DataLoaders created
-        # on the same line would collide with ActorAlreadyExistsError.
-        dataloader = DataLoader(
-            dataset=create_dataset, batch_size=base_batch, min_batch_size=base_batch,
-            device_mesh=model_mesh, remote_group='model', instance_id='bench-level1',
-        )
-        one_batch = next(iter(dataloader))
-        prompts = list(one_batch) if isinstance(one_batch, list) else [one_batch]
-        # Diagnostic: confirm the row schema and that ground truths resolve.
-        row0 = prompts[0]
-        preview = json.dumps(row0, ensure_ascii=False, default=str)
-        logger.info(f'[level1 row0] keys={sorted(row0.keys())} '
-                    f'user_data={row0.get("user_data")!r} preview={preview[:300]!r}')
-        for i, p in enumerate(prompts[:3]):
-            logger.info(f'[level1 prompt {i}] gt={_ground_truth(p)!r} '
-                        f'answer={str(p.get("answer", ""))[:60]!r}')
-        sync_weights()
-        sampler.reset_prefix_cache()
-        level1 = run_level1(sampler, pipeline, prompts, first['gen'], first['max_tokens'])
-        summary_rows.append(dict(run='level1', path='both', step=-1, batch=len(prompts),
-                                 gen=first['gen'], max_tokens=first['max_tokens'],
-                                 delay_ms=0, t_sample=0.0, t_submit=0.0, t_collect=0.0,
-                                 t_train=0.0, t_total=0.0, seq_per_s=0.0,
-                                 semantic_ok=level1['all_ok']))
-        # Persist level-1 results even if a sweep run fails afterwards.
-        flush_outputs(summary_rows)
+        if not BENCH_RM:
+            first = runs[0]
+            base_batch = max(1, first['batch'])
+            # Level-1 determinism check on one batch, before any training.
+            # instance_id keeps Ray actor names unique: remote_class derives the
+            # actor name from the caller's source line, so two DataLoaders created
+            # on the same line would collide with ActorAlreadyExistsError.
+            dataloader = DataLoader(
+                dataset=create_dataset, batch_size=base_batch, min_batch_size=base_batch,
+                device_mesh=model_mesh, remote_group='model', instance_id='bench-level1',
+            )
+            one_batch = next(iter(dataloader))
+            prompts = list(one_batch) if isinstance(one_batch, list) else [one_batch]
+            # Diagnostic: confirm the row schema and that ground truths resolve.
+            row0 = prompts[0]
+            preview = json.dumps(row0, ensure_ascii=False, default=str)
+            logger.info(f'[level1 row0] keys={sorted(row0.keys())} '
+                        f'user_data={row0.get("user_data")!r} preview={preview[:300]!r}')
+            for i, p in enumerate(prompts[:3]):
+                logger.info(f'[level1 prompt {i}] gt={_ground_truth(p)!r} '
+                            f'answer={str(p.get("answer", ""))[:60]!r}')
+            sync_weights()
+            sampler.reset_prefix_cache()
+            level1 = run_level1(sampler, pipeline, prompts, first['gen'], first['max_tokens'])
+            summary_rows.append(dict(run='level1', path='both', step=-1, batch=len(prompts),
+                                     gen=first['gen'], max_tokens=first['max_tokens'],
+                                     delay_ms=0, t_sample=0.0, t_submit=0.0, t_collect=0.0,
+                                     t_train=0.0, t_total=0.0, seq_per_s=0.0,
+                                     semantic_ok=level1['all_ok']))
+            # Persist level-1 results even if a sweep run fails afterwards.
+            flush_outputs(summary_rows)
 
         for run_cfg in runs:
             run = run_cfg['name']
@@ -717,8 +965,9 @@ def main() -> None:
             batches = [list(b) if isinstance(b, list) else [b] for b in batches]
             logger.info(f'[{run}] materialized {len(batches)} batches x {run_cfg["batch"]} prompts '
                         f'(gen={run_cfg["gen"]}, max_tokens={run_cfg["max_tokens"]}, '
-                        f'delay={run_cfg["delay_ms"]}ms)')
-            for path in ('A', 'B'):
+                        f'delay={run_cfg["delay_ms"]}ms, granularity={run_cfg.get("granularity", "-")})')
+            paths = [run_cfg['path']] if run_cfg.get('path') else ('A', 'B')
+            for path in paths:
                 summary_rows.extend(run_path(
                     run_cfg, path, sampler, pipeline, model, advantage_fn, metrics,
                     batches, sync_weights))
